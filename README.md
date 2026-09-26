@@ -26,6 +26,9 @@ as a Python module and calls the required function. For example, `lab1` loads
 `src/labs/lab1.py` and calls `gpt2_complete`; it checks the completions and
 logits against GPT-2 Small using 20 Tiny Shakespeare prompts.
 
+The [Lab 1 reading guide](docs/lab1.md) walks through the implementation,
+tensor shapes, and local checks.
+
 For `lab2`, implement `mmlu_eval()` in `src/labs/lab2.py` and include
 `src/labs/lab2.sbatch`. The function returns an A/B/C/D prediction for every
 test row in the `all` configuration of
