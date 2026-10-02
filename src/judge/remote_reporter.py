@@ -25,60 +25,66 @@ def publish_event(
     database_path: Path,
     wandb_project: str,
     wandb_entity: str | None,
+    active_runs: dict[str, wandb.Run],
 ) -> None:
-    task = TASKS[job.submission.task_id]
-    run = wandb.init(
-        project=wandb_project,
-        entity=wandb_entity,
-        id=job.id,
-        resume="allow",
-        name=f"{task.id}-{job.submission.github_actor}-{job.id[:8]}",
-        job_type="submission",
-        config={
-            "job_id": job.id,
-            "github_actor": job.submission.github_actor,
-            "task_id": job.submission.task_id,
-            "repo_url": job.submission.repo_url,
-            "commit_sha": job.submission.commit_sha,
-            "resources": task.resources.model_dump(),
-            "sub_judge": job.assigned_judge_id,
-            "slurm_job_id": job.slurm_job_id,
-        },
-        save_code=False,
-    )
-    try:
-        if job.wandb_run_id is None:
-            set_wandb_run(database_path, job.id, run_id=run.id, url=run.url)
-        if event.kind == RemoteEventKind.STARTED:
-            print(f"[judge] started Slurm job {event.slurm_job_id}", flush=True)
-        elif event.kind == RemoteEventKind.LOG:
-            assert event.line is not None
-            print(event.line, end="" if event.line.endswith("\n") else "\n", flush=True)
-        elif event.kind == RemoteEventKind.COMPLETED:
-            assert event.result is not None
-            with tempfile.TemporaryDirectory(prefix="judge-result-") as directory:
-                result_path = Path(directory) / "result.json"
-                result_path.write_text(event.result.model_dump_json(indent=2))
-                _publish_result(run, job, event.result, result_path)
-            if event.result.passed is not None:
+    run = active_runs.get(job.id)
+    if run is None:
+        task = TASKS[job.submission.task_id]
+        run = wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            id=job.id,
+            resume="allow",
+            reinit="create_new",
+            name=f"{task.id}-{job.submission.github_actor}-{job.id[:8]}",
+            job_type="submission",
+            config={
+                "job_id": job.id,
+                "github_actor": job.submission.github_actor,
+                "task_id": job.submission.task_id,
+                "repo_url": job.submission.repo_url,
+                "commit_sha": job.submission.commit_sha,
+                "resources": task.resources.model_dump(),
+                "sub_judge": job.assigned_judge_id,
+                "slurm_job_id": job.slurm_job_id,
+            },
+            save_code=False,
+        )
+        active_runs[job.id] = run
+        run.summary["judge_status"] = JobStatus.RUNNING.value
+    if job.wandb_run_id is None:
+        set_wandb_run(database_path, job.id, run_id=run.id, url=run.url)
+    if event.kind == RemoteEventKind.STARTED:
+        print(f"[judge] started Slurm job {event.slurm_job_id}", flush=True)
+    elif event.kind == RemoteEventKind.LOG:
+        assert event.line is not None
+        print(event.line, end="" if event.line.endswith("\n") else "\n", flush=True)
+    elif event.kind == RemoteEventKind.COMPLETED:
+        assert event.result is not None
+        with tempfile.TemporaryDirectory(prefix="judge-result-") as directory:
+            result_path = Path(directory) / "result.json"
+            result_path.write_text(event.result.model_dump_json(indent=2))
+            _publish_result(run, job, event.result, result_path)
+        if event.result.passed is not None:
+            print(
+                f"[judge] verdict: {'PASS' if event.result.passed else 'FAIL'}",
+                flush=True,
+            )
+        for test in event.result.tests:
+            if not test.passed:
                 print(
-                    f"[judge] verdict: {'PASS' if event.result.passed else 'FAIL'}",
+                    f"[judge] failed {test.name}: "
+                    f"{test.message or 'no reason provided'}",
                     flush=True,
                 )
-            for test in event.result.tests:
-                if not test.passed:
-                    print(
-                        f"[judge] failed {test.name}: "
-                        f"{test.message or 'no reason provided'}",
-                        flush=True,
-                    )
-        else:
-            assert event.error is not None
-            run.summary["judge_status"] = JobStatus.ERROR.value
-            run.summary["error"] = event.error
-            print(f"[judge] failed job {job.id}: {event.error}", flush=True)
-    finally:
-        run.finish()
+    else:
+        assert event.error is not None
+        run.summary["judge_status"] = JobStatus.ERROR.value
+        run.summary["error"] = event.error
+        print(f"[judge] failed job {job.id}: {event.error}", flush=True)
+    if event.kind in {RemoteEventKind.COMPLETED, RemoteEventKind.FAILED}:
+        run.finish(exit_code=1 if event.kind == RemoteEventKind.FAILED else 0)
+        del active_runs[job.id]
 
 
 def run_reporter(
@@ -90,6 +96,7 @@ def run_reporter(
     poll_interval_seconds: float = 2,
 ) -> None:
     migrate_database(database_path)
+    active_runs: dict[str, wandb.Run] = {}
     while True:
         pending = next_unreported_event(database_path)
         if pending is None:
@@ -105,6 +112,7 @@ def run_reporter(
                 database_path=database_path,
                 wandb_project=wandb_project,
                 wandb_entity=wandb_entity,
+                active_runs=active_runs,
             )
             mark_remote_event_reported(database_path, job.id, event.sequence)
         except Exception as error:  # Retry durable event later.

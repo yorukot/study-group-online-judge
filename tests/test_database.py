@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 from pathlib import Path
 
@@ -16,9 +16,11 @@ from judge.database import (
     fail_remote_dispatch,
     get_job,
     get_sub_judge,
+    heartbeat_sub_judge,
     list_sub_judges,
     mark_remote_job_queued,
     migrate_database,
+    prune_stale_sub_judges,
     register_sub_judge,
     set_wandb_run,
 )
@@ -47,7 +49,7 @@ class DatabaseTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
 
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         self.assertIn(("jobs",), tables)
         self.assertIn(("sub_judges",), tables)
         self.assertIn(("remote_events",), tables)
@@ -71,6 +73,46 @@ class DatabaseTests(unittest.TestCase):
         self.assertIsNone(migrated.assigned_judge_id)
         self.assertIsNone(migrated.slurm_job_id)
 
+    def test_upgrade_preserves_existing_agent_and_backfills_last_seen(self) -> None:
+        legacy_path = Path(self.temporary_directory.name) / "agents-v3.db"
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            scripts = [
+                files("judge.migrations").joinpath(name).read_text()
+                for name in (
+                    "001_initial.sql",
+                    "002_sub_judges.sql",
+                    "003_remote_events.sql",
+                )
+            ]
+            migration_sql = "\n".join(scripts)
+            connection.executescript(
+                f"BEGIN IMMEDIATE;\n{migration_sql}\nPRAGMA user_version = 3;\nCOMMIT;"
+            )
+        judge = self.sub_judge()
+        with closing(sqlite3.connect(legacy_path)) as connection, connection:
+            connection.execute(
+                "INSERT INTO sub_judges "
+                "(id, backend, task_ids_json, max_gpus, judge_revision, registered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    judge.id,
+                    judge.backend.value,
+                    '["gpu-lab"]',
+                    8,
+                    judge.judge_revision,
+                    judge.registered_at.isoformat(),
+                ),
+            )
+
+        migrate_database(legacy_path)
+
+        self.assertEqual(get_sub_judge(legacy_path, judge.id), judge)
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            last_seen = connection.execute(
+                "SELECT last_seen_at FROM sub_judges WHERE id = ?", (judge.id,)
+            ).fetchone()[0]
+        self.assertEqual(last_seen, judge.registered_at.isoformat())
+
     def test_rejects_a_database_from_a_newer_judge(self) -> None:
         with closing(sqlite3.connect(self.database_path)) as connection, connection:
             connection.execute("PRAGMA user_version = 999")
@@ -87,7 +129,7 @@ class DatabaseTests(unittest.TestCase):
         with closing(sqlite3.connect(database_path)) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
 
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
 
     def test_round_trips_a_queued_job(self) -> None:
         submission = Submission(
@@ -133,6 +175,63 @@ class DatabaseTests(unittest.TestCase):
         register_sub_judge(self.database_path, updated)
         self.assertEqual(get_sub_judge(self.database_path, first.id), updated)
         self.assertEqual(len(list_sub_judges(self.database_path)), 1)
+
+    def test_heartbeat_keeps_registration_until_five_minute_expiry(self) -> None:
+        registered_at = datetime(2026, 9, 29, tzinfo=UTC)
+        judge = self.sub_judge().model_copy(update={"registered_at": registered_at})
+        register_sub_judge(self.database_path, judge)
+        self.assertTrue(
+            heartbeat_sub_judge(
+                self.database_path,
+                judge.id,
+                at=registered_at + timedelta(minutes=4),
+            )
+        )
+        self.assertEqual(
+            prune_stale_sub_judges(
+                self.database_path,
+                now=registered_at + timedelta(minutes=9) - timedelta(seconds=1),
+            ),
+            [],
+        )
+        self.assertEqual(
+            prune_stale_sub_judges(
+                self.database_path, now=registered_at + timedelta(minutes=9)
+            ),
+            [judge.id],
+        )
+        self.assertIsNone(get_sub_judge(self.database_path, judge.id))
+        self.assertFalse(heartbeat_sub_judge(self.database_path, judge.id))
+
+    def test_expired_heartbeat_requires_reregistration_and_preserves_job(self) -> None:
+        registered_at = datetime(2026, 9, 29, tzinfo=UTC)
+        judge = self.sub_judge().model_copy(update={"registered_at": registered_at})
+        register_sub_judge(self.database_path, judge)
+        job = create_remote_job(
+            self.database_path,
+            self.submission(),
+            judge_id=judge.id,
+            request_key="run-1",
+        )
+        self.assertFalse(
+            heartbeat_sub_judge(
+                self.database_path,
+                judge.id,
+                at=registered_at + timedelta(minutes=5),
+            )
+        )
+        self.assertEqual(
+            prune_stale_sub_judges(
+                self.database_path, now=registered_at + timedelta(minutes=5)
+            ),
+            [judge.id],
+        )
+        self.assertEqual(get_job(self.database_path, job.id), job)
+        renewed = judge.model_copy(
+            update={"registered_at": registered_at + timedelta(minutes=5)}
+        )
+        register_sub_judge(self.database_path, renewed)
+        self.assertEqual(get_sub_judge(self.database_path, judge.id), renewed)
 
     def test_remote_job_is_not_claimed_by_local_worker(self) -> None:
         register_sub_judge(self.database_path, self.sub_judge())

@@ -37,8 +37,10 @@ RUN apt-get update \
     && chown -R judge:judge /data /home/judge/.cache
 
 COPY --from=build --chown=judge:judge /app/.venv /app/.venv
+COPY --chown=judge:judge ui/src/lab-names.json /app/lab-names.json
 
 ENV PATH="/app/.venv/bin:${PATH}" \
+    JUDGE_LAB_NAMES_PATH=/app/lab-names.json \
     JUDGE_DATABASE_PATH=/data/judge.db \
     JUDGE_REVISION=${JUDGE_REVISION} \
     HF_HOME=/home/judge/.cache/huggingface \

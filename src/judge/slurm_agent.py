@@ -48,6 +48,7 @@ class MasterClient:
             headers={
                 "Authorization": f"Bearer {self.token}",
                 "Content-Type": "application/json",
+                "User-Agent": "study-group-online-judge/0.1",
             },
         )
         try:
@@ -72,6 +73,9 @@ class MasterClient:
     def next_offer(self) -> JobOffer | None:
         response = self.request("GET", f"/agents/{self.judge_id}/next")
         return None if response is None else JobOffer.model_validate(response)
+
+    def heartbeat(self) -> None:
+        self.request("POST", f"/agents/{self.judge_id}/heartbeat")
 
     def receipt(self, job_id: str, receipt: JobReceipt) -> None:
         self.request(
@@ -255,6 +259,21 @@ class SlurmAgent:
         self.poll_seconds = poll_seconds
         self._monitors: set[str] = set()
         self._monitor_lock = threading.Lock()
+        self._registered = threading.Event()
+
+    def _heartbeat_loop(self) -> None:
+        while True:
+            time.sleep(60)
+            if not self._registered.is_set():
+                continue
+            try:
+                self.client.heartbeat()
+            except Exception as error:  # noqa: BLE001 - reconnect after transient failures
+                print(
+                    f"[agent] heartbeat failed: {type(error).__name__}: {error}",
+                    flush=True,
+                )
+                self._registered.clear()
 
     def accept(self, offer: JobOffer) -> JobReceipt:
         if offer.submission.task_id not in self.task_ids:
@@ -397,12 +416,12 @@ class SlurmAgent:
     def run(self) -> None:
         for job_id in self.ledger.submitted_job_ids():
             self._start_monitor(job_id)
-        registered = False
+        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
         while True:
             try:
-                if not registered:
+                if not self._registered.is_set():
                     self.client.register(self.task_ids, self.max_gpus, self.revision)
-                    registered = True
+                    self._registered.set()
                 offer = self.client.next_offer()
                 if offer is None:
                     continue
@@ -412,7 +431,7 @@ class SlurmAgent:
                 print(
                     f"[agent] reconnecting: {type(error).__name__}: {error}", flush=True
                 )
-                registered = False
+                self._registered.clear()
                 time.sleep(5)
 
 

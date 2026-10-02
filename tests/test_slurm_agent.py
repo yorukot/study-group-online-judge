@@ -10,7 +10,7 @@ from judge.models import (
     Resources,
     Submission,
 )
-from judge.slurm_agent import AgentLedger, SlurmAgent
+from judge.slurm_agent import AgentLedger, MasterClient, SlurmAgent
 from judge.slurm_executor import SlurmState
 
 
@@ -66,6 +66,23 @@ class SlurmAgentTests(unittest.TestCase):
         self.executor.submit.assert_called_once()
         restarted_ledger = AgentLedger(self.root / "agent.db")
         self.assertEqual(restarted_ledger.submitted_job_ids(), [self.offer.job_id])
+
+    def test_master_client_sends_heartbeat(self) -> None:
+        client = MasterClient("http://127.0.0.1:7000", "secret", "nano4")
+        with patch.object(client, "request") as request:
+            client.heartbeat()
+        request.assert_called_once_with("POST", "/agents/nano4/heartbeat")
+
+    def test_failed_heartbeat_triggers_reregistration(self) -> None:
+        self.agent._registered.set()
+        self.client.heartbeat.side_effect = RuntimeError("offline")
+        with (
+            patch("judge.slurm_agent.time.sleep", side_effect=[None, SystemExit]),
+            self.assertRaises(SystemExit),
+        ):
+            self.agent._heartbeat_loop()
+        self.client.heartbeat.assert_called_once()
+        self.assertFalse(self.agent._registered.is_set())
 
     def test_ambiguous_submission_is_not_repeated(self) -> None:
         self.ledger.claim(self.offer)

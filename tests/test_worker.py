@@ -72,6 +72,8 @@ class WorkerTests(unittest.TestCase):
 
     def test_persists_a_valid_result(self) -> None:
         def execute(**arguments: object) -> ExecutionResult:
+            self.assertEqual(self.wandb_run.summary["judge_status"], "running")
+            self.wandb_run.finish.assert_not_called()
             output_directory = arguments["output_directory"]
             assert isinstance(output_directory, Path)
             output_directory.mkdir()

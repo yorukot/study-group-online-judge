@@ -23,6 +23,34 @@ class MetricDirection(StrEnum):
     MAXIMIZE = "maximize"
 
 
+class GradingType(StrEnum):
+    PASS_FAIL = "pass_fail"
+    SCORE = "score"
+
+
+class TaskMetadata(BaseModel):
+    """Public ranking rules for a registered lab."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: str = Field(min_length=1)
+    grading_type: GradingType
+    primary_metric: str | None = Field(default=None, min_length=1)
+    metric_direction: MetricDirection | None = None
+
+    @model_validator(mode="after")
+    def validate_ranking(self) -> Self:
+        if self.grading_type == GradingType.SCORE:
+            if self.primary_metric is None or self.metric_direction is None:
+                raise ValueError(
+                    "score tasks require a primary_metric and metric_direction"
+                )
+        elif self.primary_metric is not None or self.metric_direction is not None:
+            raise ValueError(
+                "pass/fail tasks rank by passing time without a score metric"
+            )
+        return self
+
+
 class SubJudgeBackend(StrEnum):
     DOCKER = "docker"
     SLURM = "slurm"

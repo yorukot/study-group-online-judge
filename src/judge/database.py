@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from fcntl import LOCK_EX, LOCK_UN, flock
 from importlib.resources import files
 from pathlib import Path
@@ -18,7 +18,13 @@ from judge.models import (
     Submission,
 )
 
-MIGRATIONS = ("001_initial.sql", "002_sub_judges.sql", "003_remote_events.sql")
+MIGRATIONS = (
+    "001_initial.sql",
+    "002_sub_judges.sql",
+    "003_remote_events.sql",
+    "004_sub_judge_heartbeats.sql",
+)
+SUB_JUDGE_TIMEOUT = timedelta(minutes=5)
 
 
 def migrate_database(path: Path) -> None:
@@ -104,14 +110,16 @@ def register_sub_judge(path: Path, sub_judge: SubJudge) -> SubJudge:
         connection.execute(
             """
             INSERT INTO sub_judges (
-                id, backend, task_ids_json, max_gpus, judge_revision, registered_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                id, backend, task_ids_json, max_gpus, judge_revision,
+                registered_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 backend = excluded.backend,
                 task_ids_json = excluded.task_ids_json,
                 max_gpus = excluded.max_gpus,
                 judge_revision = excluded.judge_revision,
-                registered_at = excluded.registered_at
+                registered_at = excluded.registered_at,
+                last_seen_at = excluded.last_seen_at
             """,
             (
                 sub_judge.id,
@@ -120,9 +128,39 @@ def register_sub_judge(path: Path, sub_judge: SubJudge) -> SubJudge:
                 sub_judge.max_gpus,
                 sub_judge.judge_revision,
                 sub_judge.registered_at.isoformat(),
+                sub_judge.registered_at.isoformat(),
             ),
         )
     return sub_judge
+
+
+def heartbeat_sub_judge(
+    path: Path, judge_id: str, *, at: datetime | None = None
+) -> bool:
+    """Refresh a live registration; an expired agent must register again."""
+
+    now = at or datetime.now(UTC)
+    cutoff = (now - SUB_JUDGE_TIMEOUT).isoformat()
+    with closing(_connect(path)) as connection, connection:
+        cursor = connection.execute(
+            "UPDATE sub_judges SET last_seen_at = ? WHERE id = ? AND last_seen_at > ?",
+            (now.isoformat(), judge_id, cutoff),
+        )
+        return cursor.rowcount == 1
+
+
+def prune_stale_sub_judges(path: Path, *, now: datetime | None = None) -> list[str]:
+    """Deregister agents that have not pinged within five minutes."""
+
+    cutoff = ((now or datetime.now(UTC)) - SUB_JUDGE_TIMEOUT).isoformat()
+    with closing(_connect(path)) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            "SELECT id FROM sub_judges WHERE last_seen_at <= ? ORDER BY id",
+            (cutoff,),
+        ).fetchall()
+        connection.execute("DELETE FROM sub_judges WHERE last_seen_at <= ?", (cutoff,))
+    return [row[0] for row in rows]
 
 
 def get_sub_judge(path: Path, judge_id: str) -> SubJudge | None:

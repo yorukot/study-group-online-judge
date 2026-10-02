@@ -12,6 +12,7 @@ on:
         options:
           - lab1
           - lab2
+          - lab4
 
 permissions:
   contents: read

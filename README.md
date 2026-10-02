@@ -222,3 +222,22 @@ There are no periodic agent health checks; a scheduling request fails if no
 agent is actively polling or if its offer is not acknowledged. A temporary
 Nano4 development master and sub-judge completed a Lab 2 GPU submission; the
 production master-to-Nano4 deployment remains unvalidated.
+
+### Slack leaderboard notifications
+
+Notifications use Slack Markdown and the lab names in `ui/src/lab-names.json`
+(override the server file location with `JUDGE_LAB_NAMES_PATH`). Workflow Builder
+receives a single `text` variable; incoming app webhooks receive a `mrkdwn` block.
+If Workflow Builder displays Markdown markers literally, format the message in
+its Send a message step; webhook acknowledgment confirms triggering, not rendering.
+
+After the initial baseline, automatic messages are sent only for a strictly better
+all-time score (respecting minimize/maximize), or a new earliest passing submission.
+Ties and changes below first place stay quiet. Persisted records survive restarts
+and are not lowered when a run disappears. Failed Slack deliveries retry.
+
+The API container also needs `WANDB_API_KEY`: workers publish submissions, while
+`api` independently reads W&B for the leaderboard. Compose's `.env` supplies
+interpolation values; it does not automatically inject every variable into every
+container. After updating `compose.yaml` or `.env`, recreate the API with
+`docker compose up -d --force-recreate api` so it receives the new environment.

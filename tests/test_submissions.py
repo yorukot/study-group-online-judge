@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -179,6 +180,27 @@ class SubmissionRouteTests(unittest.TestCase):
         )
         self.assertEqual(retry.status_code, 201)
         self.assertEqual(retry.json()["id"], response.json()["id"])
+
+    def test_gpu_submission_rejects_an_expired_agent_even_if_poll_is_visible(
+        self,
+    ) -> None:
+        self.register_gpu_agent()
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE sub_judges SET last_seen_at = ? WHERE id = ?",
+                ("2020-01-01T00:00:00+00:00", "nano4"),
+            )
+        with patch.object(
+            app.state.agent_channel, "available_ids", new_callable=AsyncMock
+        ) as available_ids:
+            available_ids.return_value = {"nano4"}
+            response = self.client.post(
+                "/submissions",
+                headers=self.gpu_headers(),
+                json=self.submission("gpu-example"),
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("No available sub-judge", response.json()["detail"])
 
     def test_gpu_submission_exchanges_a_real_offer_and_receipt(self) -> None:
         self.register_gpu_agent()

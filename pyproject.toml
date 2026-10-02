@@ -11,10 +11,11 @@ dependencies = [
     "datasets>=4.3,<5",
     "fastapi[standard]>=0.141.1",
     "pydantic>=2.13.5",
+    "python-dotenv>=1.2.3",
     "safetensors>=0.7,<1",
     "torch>=2.10,<2.12",
     "tqdm>=4.70.1",
-    "transformers>=4.57,<5",
+    "transformers[torch]>=4.57,<5",
     "wandb>=0.30.0,<0.31",
 ]
 

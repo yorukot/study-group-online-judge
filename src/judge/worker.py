@@ -51,6 +51,7 @@ def run_job(
             },
             save_code=False,
         )
+        run.summary["judge_status"] = JobStatus.RUNNING.value
         job = set_wandb_run(
             database_path,
             job.id,

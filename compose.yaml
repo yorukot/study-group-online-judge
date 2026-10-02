@@ -9,6 +9,11 @@ services:
     environment:
       JUDGE_API_TOKEN: ${JUDGE_API_TOKEN:?JUDGE_API_TOKEN must be set}
       JUDGE_AGENT_TOKEN: ${JUDGE_AGENT_TOKEN:-}
+      WANDB_API_KEY: ${WANDB_API_KEY:?WANDB_API_KEY must be set}
+      WANDB_ENTITY: ${WANDB_ENTITY:-cerulean-labs}
+      WANDB_PROJECT: ${WANDB_PROJECT:-study-group-labs}
+      JUDGE_SLACK_WEBHOOK_URL: ${JUDGE_SLACK_WEBHOOK_URL:-}
+      JUDGE_LEADERBOARD_REFRESH_SECONDS: ${JUDGE_LEADERBOARD_REFRESH_SECONDS:-60}
     volumes:
       - judge-data:/data
       - hf-cache:/home/judge/.cache/huggingface
@@ -39,9 +44,9 @@ services:
       JUDGE_UV_CACHE_VOLUME: study-group-online-judge-uv-cache
       WANDB_API_KEY: ${WANDB_API_KEY:?WANDB_API_KEY must be set}
       WANDB_DIR: /data/wandb
-      WANDB_ENTITY: ${WANDB_ENTITY:-}
+      WANDB_ENTITY: ${WANDB_ENTITY:-cerulean-labs}
       WANDB_MODE: ${WANDB_MODE:-online}
-      WANDB_PROJECT: ${WANDB_PROJECT:?WANDB_PROJECT must be set}
+      WANDB_PROJECT: ${WANDB_PROJECT:-study-group-labs}
     group_add:
       - ${DOCKER_GID:?DOCKER_GID must be set}
     volumes:
@@ -64,9 +69,9 @@ services:
     environment:
       WANDB_API_KEY: ${WANDB_API_KEY:?WANDB_API_KEY must be set}
       WANDB_DIR: /data/wandb
-      WANDB_ENTITY: ${WANDB_ENTITY:-}
+      WANDB_ENTITY: ${WANDB_ENTITY:-cerulean-labs}
       WANDB_MODE: ${WANDB_MODE:-online}
-      WANDB_PROJECT: ${WANDB_PROJECT:?WANDB_PROJECT must be set}
+      WANDB_PROJECT: ${WANDB_PROJECT:-study-group-labs}
     volumes:
       - judge-data:/data
 

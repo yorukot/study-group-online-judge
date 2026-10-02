@@ -1,4 +1,3 @@
-import importlib.util
 import sys
 import traceback
 from pathlib import Path
@@ -7,8 +6,8 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from judge.models import JudgeResult, Resources, TestResult
-from judge.tasks.base import Task
+from judge.models import GradingType, JudgeResult, Resources, TestResult
+from judge.tasks.base import Task, load_student_function
 
 MODEL_ID = "openai-community/gpt2"
 MAX_SEQ_LENGTH = 10
@@ -38,20 +37,6 @@ TINY_SHAKESPEARE_SAMPLES = (
     "Very well; and could be content to give him good",
     "report fort, but that he pays himself with being proud.",
 )
-
-
-def _load_student_function(submission: Path):
-    source = submission / "src" / "labs" / "lab1.py"
-    if not source.is_file():
-        raise FileNotFoundError("Expected src/labs/lab1.py in the submission")
-
-    spec = importlib.util.spec_from_file_location("student_lab1", source)
-    if spec is None or spec.loader is None:
-        raise ImportError("Could not import src/labs/lab1.py")
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.gpt2_complete
 
 
 def _reference_completion(
@@ -131,6 +116,7 @@ def _reference_completion(
 
 
 class Lab1(Task):
+    grading_type = GradingType.PASS_FAIL
     id = "lab1"
     resources = Resources(cpus=4, memory_gb=8, timeout_seconds=600)
 
@@ -156,7 +142,7 @@ class Lab1(Task):
                     "[lab1] loading student implementation from src/labs/lab1.py",
                     flush=True,
                 )
-                complete = _load_student_function(submission)
+                complete = load_student_function(submission, "lab1").gpt2_complete
                 print("[lab1] running student model and batched generation", flush=True)
                 completions, logits = complete(prompts, max_seq_length=MAX_SEQ_LENGTH)
                 print("[lab1] student generation finished", flush=True)

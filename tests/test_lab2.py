@@ -5,14 +5,11 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from judge.tasks.lab2 import (
-    Lab2,
-    _load_student_function,
-    _prompt,
-    question_key,
-)
+from judge.tasks.base import load_student_function
+from judge.tasks.lab2 import Lab2, _prompt, question_key
 
 
 def row(subject: str, question: str, answer: int = 0) -> dict:
@@ -69,7 +66,10 @@ class Lab2Tests(unittest.TestCase):
             source.parent.mkdir(parents=True)
             source.write_text("def mmlu_eval():\n    return {'hash': 'A'}\n")
 
-            self.assertEqual(_load_student_function(Path(directory))(), {"hash": "A"})
+            self.assertEqual(
+                load_student_function(Path(directory), "lab2").mmlu_eval(),
+                {"hash": "A"},
+            )
 
     def evaluate_with(self, size: int, wrong: int):
         rows = [row("high_school_mathematics", f"Question {i}?") for i in range(size)]
@@ -82,7 +82,8 @@ class Lab2Tests(unittest.TestCase):
         with (
             patch("judge.tasks.lab2._load_data", return_value=(exemplars, rows)),
             patch(
-                "judge.tasks.lab2._load_student_function", return_value=lambda: answers
+                "judge.tasks.lab2.load_student_function",
+                return_value=SimpleNamespace(mmlu_eval=lambda: answers),
             ),
             patch(
                 "judge.tasks.lab2._reference_predictions", return_value=expected
@@ -126,8 +127,8 @@ class Lab2Tests(unittest.TestCase):
         with (
             patch("judge.tasks.lab2._load_data", return_value=({"math": rows}, rows)),
             patch(
-                "judge.tasks.lab2._load_student_function",
-                return_value=lambda: predictions,
+                "judge.tasks.lab2.load_student_function",
+                return_value=SimpleNamespace(mmlu_eval=lambda: predictions),
             ),
             patch("judge.tasks.lab2._reference_predictions", return_value=predictions),
             patch("judge.tasks.lab2.torch.set_num_threads"),
@@ -150,8 +151,8 @@ class Lab2Tests(unittest.TestCase):
         with (
             patch("judge.tasks.lab2._load_data", return_value=(exemplars, rows)),
             patch(
-                "judge.tasks.lab2._load_student_function",
-                return_value=lambda: predictions,
+                "judge.tasks.lab2.load_student_function",
+                return_value=SimpleNamespace(mmlu_eval=lambda: predictions),
             ),
             patch("judge.tasks.lab2._reference_predictions", return_value=predictions),
             patch("judge.tasks.lab2.torch.set_num_threads"),
@@ -167,7 +168,10 @@ class Lab2Tests(unittest.TestCase):
         rows = [row("math", "one"), row("math", "two")]
         with (
             patch("judge.tasks.lab2._load_data", return_value=({"math": rows}, rows)),
-            patch("judge.tasks.lab2._load_student_function", return_value=dict),
+            patch(
+                "judge.tasks.lab2.load_student_function",
+                return_value=SimpleNamespace(mmlu_eval=dict),
+            ),
             patch("judge.tasks.lab2._reference_predictions") as reference,
             patch("judge.tasks.lab2.torch.set_num_threads"),
             redirect_stdout(StringIO()),
@@ -184,7 +188,7 @@ class Lab2Tests(unittest.TestCase):
         with (
             patch("judge.tasks.lab2._load_data", return_value=({"math": rows}, rows)),
             patch(
-                "judge.tasks.lab2._load_student_function",
+                "judge.tasks.lab2.load_student_function",
                 side_effect=ValueError("broken"),
             ),
             patch("judge.tasks.lab2.torch.set_num_threads"),

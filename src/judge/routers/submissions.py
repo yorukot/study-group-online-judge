@@ -83,6 +83,7 @@ async def submit(
             )
         job = previous
     else:
+        database.prune_stale_sub_judges(database_path)
         available = await request.app.state.agent_channel.available_ids()
         judge = next(
             (

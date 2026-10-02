@@ -3,11 +3,13 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from judge.tasks.lab1 import Lab1, _load_student_function
+from judge.tasks.base import load_student_function
+from judge.tasks.lab1 import Lab1
 
 
 class FakeTokenizer:
@@ -27,7 +29,7 @@ class Lab1Tests(unittest.TestCase):
                 "def gpt2_complete(input, max_seq_length=1024):\n    return input, None\n"
             )
 
-            complete = _load_student_function(Path(directory))
+            complete = load_student_function(Path(directory), "lab1").gpt2_complete
 
             self.assertEqual(complete(["hello"]), (["hello"], None))
 
@@ -43,7 +45,10 @@ class Lab1Tests(unittest.TestCase):
 
         with (
             patch("judge.tasks.lab1.AutoTokenizer.from_pretrained") as tokenizer,
-            patch("judge.tasks.lab1._load_student_function", return_value=student),
+            patch(
+                "judge.tasks.lab1.load_student_function",
+                return_value=SimpleNamespace(gpt2_complete=student),
+            ),
             patch(
                 "judge.tasks.lab1._reference_completion",
                 return_value=(completions, expected_logits),
@@ -86,7 +91,7 @@ class Lab1Tests(unittest.TestCase):
         with (
             patch("judge.tasks.lab1.AutoTokenizer.from_pretrained") as tokenizer,
             patch(
-                "judge.tasks.lab1._load_student_function",
+                "judge.tasks.lab1.load_student_function",
                 side_effect=RuntimeError("model download failed"),
             ),
             patch("judge.tasks.lab1.torch.set_num_threads"),

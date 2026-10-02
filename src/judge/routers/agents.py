@@ -6,7 +6,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from judge.agent_channel import AgentPollConflict, UnknownOffer
-from judge.database import append_remote_event, get_sub_judge, register_sub_judge
+from judge.database import (
+    append_remote_event,
+    get_sub_judge,
+    heartbeat_sub_judge,
+    register_sub_judge,
+)
 from judge.models import (
     Job,
     JobOffer,
@@ -73,6 +78,13 @@ async def next_job(judge_id: str, request: Request) -> JobOffer | Response:
     if offer is None:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     return offer
+
+
+@router.post("/{judge_id}/heartbeat", status_code=204)
+def heartbeat(judge_id: str, request: Request) -> Response:
+    if not heartbeat_sub_judge(request.app.state.database_path, judge_id):
+        raise HTTPException(status_code=404, detail="Sub-judge is not registered")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/{judge_id}/jobs/{job_id}/receipt", status_code=204)

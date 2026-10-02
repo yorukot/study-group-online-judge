@@ -165,6 +165,7 @@ class RemoteReportingTests(unittest.TestCase):
         run = Mock()
         run.id = self.job.id
         run.url = "https://wandb.ai/example/run"
+        run.summary = {}
         with (
             patch("judge.remote_reporter.wandb.init", return_value=run),
             patch("judge.remote_reporter.set_wandb_run"),
@@ -176,11 +177,125 @@ class RemoteReportingTests(unittest.TestCase):
                 database_path=self.path,
                 wandb_project="study-group",
                 wandb_entity=None,
+                active_runs={},
             )
 
         output.assert_called_once_with("training\n", end="", flush=True)
         run.log.assert_not_called()
-        run.finish.assert_called_once()
+        run.finish.assert_not_called()
+        self.assertEqual(run.summary["judge_status"], "running")
+
+    def publish(self, job, event, active_runs) -> None:
+        publish_event(
+            job,
+            event,
+            database_path=self.path,
+            wandb_project="study-group",
+            wandb_entity=None,
+            active_runs=active_runs,
+        )
+
+    def test_run_stays_running_until_result_is_published(self) -> None:
+        run = Mock(id=self.job.id, url="https://wandb.ai/example/run", summary={})
+        active_runs = {}
+        with (
+            patch("judge.remote_reporter.wandb.init", return_value=run) as init,
+            patch("judge.remote_reporter.set_wandb_run"),
+            patch("judge.remote_reporter._publish_result") as publish_result,
+        ):
+            self.publish(self.job, self.event(1, RemoteEventKind.STARTED), active_runs)
+            self.assertEqual(run.summary["judge_status"], "running")
+            run.finish.assert_not_called()
+            self.publish(
+                self.job,
+                self.event(2, RemoteEventKind.LOG, line="training"),
+                active_runs,
+            )
+            run.finish.assert_not_called()
+            self.publish(
+                self.job,
+                self.event(
+                    3, RemoteEventKind.COMPLETED, result=JudgeResult(passed=True)
+                ),
+                active_runs,
+            )
+
+        init.assert_called_once()
+        self.assertEqual(init.call_args.kwargs["reinit"], "create_new")
+        publish_result.assert_called_once()
+        run.finish.assert_called_once_with(exit_code=0)
+        self.assertEqual(active_runs, {})
+
+    def test_concurrent_jobs_keep_separate_active_runs(self) -> None:
+        other_job = self.job.model_copy(update={"id": "other-job"})
+        runs = [
+            Mock(id=job.id, url="https://wandb.ai/example/run", summary={})
+            for job in (self.job, other_job)
+        ]
+        active_runs = {}
+        with (
+            patch("judge.remote_reporter.wandb.init", side_effect=runs) as init,
+            patch("judge.remote_reporter.set_wandb_run"),
+        ):
+            for job in (self.job, other_job):
+                self.publish(job, self.event(1, RemoteEventKind.STARTED), active_runs)
+            self.publish(
+                self.job,
+                self.event(2, RemoteEventKind.FAILED, error="bad model"),
+                active_runs,
+            )
+
+        self.assertEqual(init.call_count, 2)
+        self.assertEqual(active_runs, {other_job.id: runs[1]})
+        runs[0].finish.assert_called_once_with(exit_code=1)
+        self.assertEqual(runs[0].summary["judge_status"], "error")
+        runs[1].finish.assert_not_called()
+
+    def test_reporting_failure_keeps_run_open_for_retry(self) -> None:
+        run = Mock(id=self.job.id, url="https://wandb.ai/example/run", summary={})
+        active_runs = {}
+        event = self.event(
+            2, RemoteEventKind.COMPLETED, result=JudgeResult(passed=True)
+        )
+        with (
+            patch("judge.remote_reporter.wandb.init", return_value=run) as init,
+            patch("judge.remote_reporter.set_wandb_run"),
+            patch(
+                "judge.remote_reporter._publish_result",
+                side_effect=[RuntimeError("offline"), None],
+            ),
+        ):
+            self.publish(self.job, self.event(1, RemoteEventKind.STARTED), active_runs)
+            with self.assertRaisesRegex(RuntimeError, "offline"):
+                self.publish(self.job, event, active_runs)
+            run.finish.assert_not_called()
+            self.assertEqual(active_runs, {self.job.id: run})
+            self.publish(self.job, event, active_runs)
+
+        init.assert_called_once()
+        run.finish.assert_called_once_with(exit_code=0)
+        self.assertEqual(active_runs, {})
+
+    def test_reporter_reuses_run_across_durable_events(self) -> None:
+        for event in (
+            self.event(1, RemoteEventKind.STARTED),
+            self.event(2, RemoteEventKind.LOG, line="training"),
+            self.event(3, RemoteEventKind.COMPLETED, result=JudgeResult(passed=True)),
+        ):
+            append_remote_event(self.path, "nano4", self.job.id, event)
+        run = Mock(id=self.job.id, url="https://wandb.ai/example/run", summary={})
+        with (
+            patch("judge.remote_reporter.wandb.init", return_value=run) as init,
+            patch("judge.worker.wandb.Artifact"),
+        ):
+            run_reporter(
+                database_path=self.path, wandb_project="study-group", once=True
+            )
+
+        init.assert_called_once()
+        self.assertEqual(run.summary["judge_status"], "completed")
+        run.finish.assert_called_once_with(exit_code=0)
+        self.assertIsNone(next_unreported_event(self.path))
 
 
 if __name__ == "__main__":

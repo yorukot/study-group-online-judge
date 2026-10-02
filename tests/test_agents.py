@@ -78,6 +78,15 @@ class AgentRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
 
+    def test_heartbeat_requires_a_live_registration_and_agent_token(self) -> None:
+        route = "/agents/nano4/heartbeat"
+        self.assertEqual(self.client.post(route, headers=self.headers).status_code, 404)
+        self.client.post(
+            "/agents/register", headers=self.headers, json=self.registration()
+        )
+        self.assertEqual(self.client.post(route).status_code, 401)
+        self.assertEqual(self.client.post(route, headers=self.headers).status_code, 204)
+
     def test_poll_returns_an_offer_or_no_content(self) -> None:
         self.client.post(
             "/agents/register", headers=self.headers, json=self.registration()
