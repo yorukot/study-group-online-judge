@@ -1,30 +1,32 @@
 import json
 import sqlite3
 from contextlib import closing
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from fcntl import LOCK_EX, LOCK_UN, flock
 from importlib.resources import files
 from pathlib import Path
 from uuid import uuid4
 
 from judge.models import (
+    ExecutionBackend,
     Job,
     JobStatus,
     JudgeResult,
     RemoteEvent,
     RemoteEventKind,
-    SubJudge,
-    SubJudgeBackend,
+    Resources,
     Submission,
 )
+from judge.ssh import RemoteConfig, RemoteRequest, RemoteSnapshot
 
 MIGRATIONS = (
     "001_initial.sql",
     "002_sub_judges.sql",
     "003_remote_events.sql",
     "004_sub_judge_heartbeats.sql",
+    "005_ssh_slurm.sql",
+    "006_remote_reporting.sql",
 )
-SUB_JUDGE_TIMEOUT = timedelta(minutes=5)
 
 
 def migrate_database(path: Path) -> None:
@@ -103,92 +105,17 @@ def create_job(path: Path, submission: Submission) -> Job:
     return job
 
 
-def register_sub_judge(path: Path, sub_judge: SubJudge) -> SubJudge:
-    """Save a sub-judge's declared capabilities on registration."""
-
-    with closing(_connect(path)) as connection, connection:
-        connection.execute(
-            """
-            INSERT INTO sub_judges (
-                id, backend, task_ids_json, max_gpus, judge_revision,
-                registered_at, last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                backend = excluded.backend,
-                task_ids_json = excluded.task_ids_json,
-                max_gpus = excluded.max_gpus,
-                judge_revision = excluded.judge_revision,
-                registered_at = excluded.registered_at,
-                last_seen_at = excluded.last_seen_at
-            """,
-            (
-                sub_judge.id,
-                sub_judge.backend.value,
-                json.dumps(sub_judge.task_ids),
-                sub_judge.max_gpus,
-                sub_judge.judge_revision,
-                sub_judge.registered_at.isoformat(),
-                sub_judge.registered_at.isoformat(),
-            ),
-        )
-    return sub_judge
-
-
-def heartbeat_sub_judge(
-    path: Path, judge_id: str, *, at: datetime | None = None
-) -> bool:
-    """Refresh a live registration; an expired agent must register again."""
-
-    now = at or datetime.now(UTC)
-    cutoff = (now - SUB_JUDGE_TIMEOUT).isoformat()
-    with closing(_connect(path)) as connection, connection:
-        cursor = connection.execute(
-            "UPDATE sub_judges SET last_seen_at = ? WHERE id = ? AND last_seen_at > ?",
-            (now.isoformat(), judge_id, cutoff),
-        )
-        return cursor.rowcount == 1
-
-
-def prune_stale_sub_judges(path: Path, *, now: datetime | None = None) -> list[str]:
-    """Deregister agents that have not pinged within five minutes."""
-
-    cutoff = ((now or datetime.now(UTC)) - SUB_JUDGE_TIMEOUT).isoformat()
-    with closing(_connect(path)) as connection, connection:
-        connection.execute("BEGIN IMMEDIATE")
-        rows = connection.execute(
-            "SELECT id FROM sub_judges WHERE last_seen_at <= ? ORDER BY id",
-            (cutoff,),
-        ).fetchall()
-        connection.execute("DELETE FROM sub_judges WHERE last_seen_at <= ?", (cutoff,))
-    return [row[0] for row in rows]
-
-
-def get_sub_judge(path: Path, judge_id: str) -> SubJudge | None:
-    with closing(_connect(path)) as connection:
-        row = connection.execute(
-            "SELECT * FROM sub_judges WHERE id = ?", (judge_id,)
-        ).fetchone()
-    return None if row is None else _sub_judge_from_row(row)
-
-
-def list_sub_judges(path: Path) -> list[SubJudge]:
-    with closing(_connect(path)) as connection:
-        rows = connection.execute("SELECT * FROM sub_judges ORDER BY id").fetchall()
-    return [_sub_judge_from_row(row) for row in rows]
-
-
 def create_remote_job(
     path: Path,
     submission: Submission,
     *,
-    judge_id: str,
+    config: RemoteConfig,
+    resources: Resources,
     request_key: str,
 ) -> Job:
-    """Reserve a remote job, reusing its ID when the same request is retried."""
-
+    """Atomically queue a GPU job and freeze its remote configuration."""
     if not request_key:
         raise ValueError("request_key must not be empty")
-
     with closing(_connect(path)) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
@@ -200,27 +127,16 @@ def create_remote_job(
             if existing.submission != submission:
                 raise ValueError("request_key was already used for another submission")
             return existing
-
-        registered = connection.execute(
-            "SELECT 1 FROM sub_judges WHERE id = ?", (judge_id,)
-        ).fetchone()
-        if registered is None:
-            raise ValueError(f"Unknown sub-judge: {judge_id}")
-
         job = Job(
             id=uuid4().hex,
             submission=submission,
-            status=JobStatus.DISPATCHING,
+            status=JobStatus.QUEUED,
             created_at=datetime.now(UTC),
-            assigned_judge_id=judge_id,
+            execution_backend=ExecutionBackend.SSH_SLURM,
         )
         connection.execute(
-            """
-            INSERT INTO jobs (
-                id, repo_url, commit_sha, task_id, github_actor,
-                status, created_at, assigned_judge_id, request_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            "INSERT INTO jobs (id, repo_url, commit_sha, task_id, github_actor, "
+            "status, created_at, execution_backend, request_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 job.id,
                 submission.repo_url,
@@ -229,60 +145,56 @@ def create_remote_job(
                 submission.github_actor,
                 job.status.value,
                 job.created_at.isoformat(),
-                judge_id,
+                job.execution_backend.value,
                 request_key,
             ),
         )
+        connection.execute(
+            "INSERT INTO ssh_jobs (job_id, config_json, resources_json) VALUES (?, ?, ?)",
+            (job.id, config.model_dump_json(), resources.model_dump_json()),
+        )
     return job
 
 
-def mark_remote_job_queued(
-    path: Path, job_id: str, slurm_job_id: str | None = None
-) -> Job:
-    """Record a sub-judge's acceptance of an assigned job."""
+def pending_ssh_jobs(path: Path) -> list[RemoteRequest]:
+    """Recover all unfinished SSH jobs, including preparation after a restart."""
+    with closing(_connect(path)) as connection:
+        rows = connection.execute(
+            "SELECT j.*, s.config_json, s.resources_json, s.setup_offset, s.log_offset "
+            "FROM jobs j JOIN ssh_jobs s ON s.job_id = j.id "
+            "WHERE j.status IN ('queued', 'dispatching', 'running') OR s.report_pending = 1 "
+            "ORDER BY j.created_at, j.id"
+        ).fetchall()
+    return [
+        RemoteRequest(
+            job_id=row["id"],
+            submission=_job_from_row(row).submission,
+            config=RemoteConfig.model_validate_json(row["config_json"]),
+            resources=Resources.model_validate_json(row["resources_json"]),
+            setup_offset=row["setup_offset"],
+            log_offset=row["log_offset"],
+        )
+        for row in rows
+    ]
 
-    if slurm_job_id == "":
-        raise ValueError("slurm_job_id must not be empty")
 
+def begin_remote_job(path: Path, job_id: str) -> None:
     with closing(_connect(path)) as connection, connection:
         cursor = connection.execute(
-            """
-            UPDATE jobs SET status = ?, slurm_job_id = ?
-            WHERE id = ? AND status = ? AND assigned_judge_id IS NOT NULL
-            """,
-            (
-                JobStatus.QUEUED.value,
-                slurm_job_id,
-                job_id,
-                JobStatus.DISPATCHING.value,
-            ),
+            "UPDATE jobs SET status = 'dispatching' WHERE id = ? "
+            "AND execution_backend = 'ssh_slurm' AND status = 'queued' AND slurm_job_id IS NULL",
+            (job_id,),
         )
-        if cursor.rowcount != 1:
-            row = connection.execute(
-                "SELECT * FROM jobs WHERE id = ?", (job_id,)
-            ).fetchone()
-            if (
-                row is None
-                or row["assigned_judge_id"] is None
-                or row["slurm_job_id"] != slurm_job_id
-                or row["status"]
-                not in {
-                    JobStatus.QUEUED.value,
-                    JobStatus.RUNNING.value,
-                    JobStatus.COMPLETED.value,
-                    JobStatus.ERROR.value,
-                }
-                or (
-                    row["status"] == JobStatus.ERROR.value
-                    and row["slurm_job_id"] is None
-                )
-            ):
-                raise RuntimeError(f"Job {job_id!r} cannot be marked queued")
-
-    job = get_job(path, job_id)
-    if job is None:
-        raise RuntimeError(f"Job {job_id!r} disappeared from the database")
-    return job
+        if cursor.rowcount:
+            _append_remote_event(
+                connection,
+                job_id,
+                RemoteEvent(
+                    sequence=_next_sequence(connection, job_id),
+                    kind=RemoteEventKind.LOG,
+                    line="[judge] preparing remote repository\n",
+                ),
+            )
 
 
 def get_job(path: Path, job_id: str) -> Job | None:
@@ -317,7 +229,7 @@ def claim_next_job(path: Path) -> Job | None:
             row = connection.execute(
                 """
                 SELECT * FROM jobs
-                WHERE status = ? AND assigned_judge_id IS NULL
+                WHERE status = ? AND execution_backend = 'docker'
                 ORDER BY created_at, id
                 LIMIT 1
                 """,
@@ -332,7 +244,7 @@ def claim_next_job(path: Path) -> Job | None:
                 """
                 UPDATE jobs
                 SET status = ?, started_at = ?
-                WHERE id = ? AND status = ? AND assigned_judge_id IS NULL
+                WHERE id = ? AND status = ? AND execution_backend = 'docker'
                 """,
                 (
                     JobStatus.RUNNING.value,
@@ -370,7 +282,7 @@ def set_wandb_run(
             UPDATE jobs
             SET wandb_run_id = ?, wandb_url = ?
             WHERE id = ? AND (
-                status = ? OR assigned_judge_id IS NOT NULL
+                status = ? OR execution_backend != 'docker'
             )
             """,
             (run_id, url, job_id, JobStatus.RUNNING.value),
@@ -408,121 +320,156 @@ def fail_job(path: Path, job_id: str, error: str) -> Job:
     )
 
 
-def fail_remote_dispatch(path: Path, job_id: str, error: str) -> Job:
-    """Record a definite failure before Slurm accepted a remote job."""
+def _next_sequence(connection: sqlite3.Connection, job_id: str) -> int:
+    return connection.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM remote_events WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()[0]
 
-    finished_at = datetime.now(UTC).isoformat()
-    with closing(_connect(path)) as connection, connection:
-        cursor = connection.execute(
-            """
-            UPDATE jobs SET status = ?, finished_at = ?, error = ?
-            WHERE id = ? AND status = ? AND assigned_judge_id IS NOT NULL
-            """,
+
+def _append_remote_event(
+    connection: sqlite3.Connection, job_id: str, event: RemoteEvent
+) -> None:
+    row = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if row is None or row["execution_backend"] != "ssh_slurm":
+        raise ValueError("Job is not an SSH Slurm job")
+    encoded = event.model_dump_json()
+    existing = connection.execute(
+        "SELECT event_json FROM remote_events WHERE job_id = ? AND sequence = ?",
+        (job_id, event.sequence),
+    ).fetchone()
+    if existing:
+        if existing[0] != encoded:
+            raise ValueError("Event sequence already contains different data")
+        return
+    expected = _next_sequence(connection, job_id)
+    if event.sequence != expected:
+        raise ValueError(f"Expected event sequence {expected}")
+    if row["status"] in ("completed", "error"):
+        raise ValueError("Job is not running")
+    if event.slurm_job_id and row["slurm_job_id"] not in (None, event.slurm_job_id):
+        raise ValueError("Slurm job ID does not match the scheduling receipt")
+    if event.kind == RemoteEventKind.STARTED:
+        if row["status"] == "running":
+            raise ValueError("Job is already running")
+        connection.execute(
+            "UPDATE jobs SET status = 'running', started_at = ?, slurm_job_id = ? WHERE id = ?",
+            (datetime.now(UTC).isoformat(), event.slurm_job_id, job_id),
+        )
+    elif event.kind in (RemoteEventKind.COMPLETED, RemoteEventKind.FAILED):
+        if event.kind == RemoteEventKind.COMPLETED and row["status"] != "running":
+            raise ValueError("Job is not running")
+        connection.execute(
+            "UPDATE jobs SET status = ?, finished_at = ?, result_json = ?, error = ? WHERE id = ?",
             (
-                JobStatus.ERROR.value,
-                finished_at,
-                error,
+                "completed" if event.result else "error",
+                datetime.now(UTC).isoformat(),
+                event.result.model_dump_json() if event.result else None,
+                event.error,
                 job_id,
-                JobStatus.DISPATCHING.value,
             ),
         )
-        if cursor.rowcount != 1:
-            raise RuntimeError(f"Job {job_id!r} is not dispatching")
-
-    job = get_job(path, job_id)
-    if job is None:
-        raise RuntimeError(f"Job {job_id!r} disappeared from the database")
-    return job
+    connection.execute(
+        "INSERT INTO remote_events (job_id, sequence, event_json, reported_at) VALUES (?, ?, ?, ?)",
+        (job_id, event.sequence, encoded, datetime.now(UTC).isoformat()),
+    )
 
 
-def append_remote_event(
-    path: Path, judge_id: str, job_id: str, event: RemoteEvent
+def append_remote_event(path: Path, job_id: str, event: RemoteEvent) -> Job:
+    """Persist an ordered event once, including errors before Slurm acceptance."""
+    with closing(_connect(path)) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        _append_remote_event(connection, job_id, event)
+        row = connection.execute(
+            "SELECT * FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+    return _job_from_row(row)
+
+
+def record_ssh_snapshot(
+    path: Path, request: RemoteRequest, snapshot: RemoteSnapshot
 ) -> Job:
-    """Apply one ordered remote event exactly once to the master database."""
-
-    encoded = event.model_dump_json()
-    with closing(_connect(path)) as connection:
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM jobs WHERE id = ? AND assigned_judge_id = ?",
-                (job_id, judge_id),
-            ).fetchone()
-            if row is None:
-                raise ValueError("Job is not assigned to this sub-judge")
-            existing = connection.execute(
-                "SELECT event_json FROM remote_events WHERE job_id = ? AND sequence = ?",
-                (job_id, event.sequence),
-            ).fetchone()
-            if existing is not None:
-                if existing["event_json"] != encoded:
-                    raise ValueError("Event sequence already contains different data")
-                connection.commit()
-                job = get_job(path, job_id)
-                assert job is not None
-                return job
-            last = connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) FROM remote_events WHERE job_id = ?",
-                (job_id,),
-            ).fetchone()[0]
-            if event.sequence != last + 1:
-                raise ValueError(f"Expected event sequence {last + 1}")
-            if row["slurm_job_id"] not in (None, event.slurm_job_id):
-                raise ValueError("Slurm job ID does not match the scheduling receipt")
-
-            status = JobStatus(row["status"])
-            if event.kind == RemoteEventKind.STARTED:
-                if status not in (JobStatus.DISPATCHING, JobStatus.QUEUED):
-                    raise ValueError("Job cannot start from its current state")
-                connection.execute(
-                    """
-                    UPDATE jobs SET status = ?, started_at = ?, slurm_job_id = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        JobStatus.RUNNING.value,
-                        datetime.now(UTC).isoformat(),
-                        event.slurm_job_id,
-                        job_id,
-                    ),
-                )
-            else:
-                if status != JobStatus.RUNNING:
-                    raise ValueError("Job is not running")
-                if event.kind in (RemoteEventKind.COMPLETED, RemoteEventKind.FAILED):
-                    connection.execute(
-                        """
-                        UPDATE jobs SET status = ?, finished_at = ?, result_json = ?, error = ?
-                        WHERE id = ?
-                        """,
-                        (
-                            (
-                                JobStatus.COMPLETED
-                                if event.kind == RemoteEventKind.COMPLETED
-                                else JobStatus.ERROR
-                            ).value,
-                            datetime.now(UTC).isoformat(),
-                            event.result.model_dump_json() if event.result else None,
-                            event.error,
-                            job_id,
-                        ),
-                    )
-
+    """Commit logs, their byte offsets, and state transitions in one transaction."""
+    with closing(_connect(path)) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT * FROM jobs WHERE id = ?", (request.job_id,)
+        ).fetchone()
+        cursor = connection.execute(
+            "SELECT * FROM ssh_jobs WHERE job_id = ?", (request.job_id,)
+        ).fetchone()
+        if row is None or cursor is None:
+            raise ValueError("Unknown SSH job")
+        connection.execute(
+            "UPDATE ssh_jobs SET report_pending = ? WHERE job_id = ?",
+            (snapshot.report_pending, request.job_id),
+        )
+        if snapshot.wandb_url:
             connection.execute(
-                """
-                INSERT INTO remote_events (job_id, sequence, event_json, reported_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (job_id, event.sequence, encoded, datetime.now(UTC).isoformat()),
+                "UPDATE jobs SET wandb_run_id = ?, wandb_url = ? WHERE id = ?",
+                (request.job_id, snapshot.wandb_url, request.job_id),
             )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+        if (
+            cursor["setup_offset"] != request.setup_offset
+            or cursor["log_offset"] != request.log_offset
+        ):
+            raise ValueError("Stale remote log offsets")
+        if (
+            snapshot.setup_offset < request.setup_offset
+            or snapshot.log_offset < request.log_offset
+        ):
+            raise ValueError("Remote logs moved backwards")
+        if row["status"] in ("completed", "error"):
+            updated = connection.execute(
+                "SELECT * FROM jobs WHERE id = ?", (request.job_id,)
+            ).fetchone()
+            return _job_from_row(updated)
+        if snapshot.slurm_job_id:
+            if row["slurm_job_id"] not in (None, snapshot.slurm_job_id):
+                raise ValueError("Slurm job ID changed")
+            connection.execute(
+                "UPDATE jobs SET slurm_job_id = ?, status = CASE WHEN status = 'running' "
+                "THEN status ELSE 'queued' END WHERE id = ?",
+                (snapshot.slurm_job_id, request.job_id),
+            )
 
-    job = get_job(path, job_id)
-    assert job is not None
-    return job
+        def event(kind: RemoteEventKind, **payload) -> None:
+            _append_remote_event(
+                connection,
+                request.job_id,
+                RemoteEvent(
+                    sequence=_next_sequence(connection, request.job_id),
+                    kind=kind,
+                    slurm_job_id=snapshot.slurm_job_id,
+                    **payload,
+                ),
+            )
+
+        if (
+            row["status"] != "running"
+            and snapshot.slurm_job_id
+            and (
+                snapshot.slurm_state in ("RUNNING", "COMPLETING")
+                or snapshot.result is not None
+            )
+        ):
+            event(RemoteEventKind.STARTED)
+        for text in (snapshot.setup_log, snapshot.slurm_log):
+            if text:
+                event(RemoteEventKind.LOG, line=text)
+        connection.execute(
+            "UPDATE ssh_jobs SET setup_offset = ?, log_offset = ? WHERE job_id = ?",
+            (snapshot.setup_offset, snapshot.log_offset, request.job_id),
+        )
+        if not snapshot.logs_remaining:
+            if snapshot.error:
+                event(RemoteEventKind.FAILED, error=snapshot.error)
+            elif snapshot.result is not None:
+                event(RemoteEventKind.COMPLETED, result=snapshot.result)
+        updated = connection.execute(
+            "SELECT * FROM jobs WHERE id = ?", (request.job_id,)
+        ).fetchone()
+    return _job_from_row(updated)
 
 
 def next_unreported_event(path: Path) -> tuple[Job, RemoteEvent] | None:
@@ -620,17 +567,6 @@ def _job_from_row(row: sqlite3.Row) -> Job:
         error=row["error"],
         wandb_run_id=row["wandb_run_id"],
         wandb_url=row["wandb_url"],
-        assigned_judge_id=row["assigned_judge_id"],
+        execution_backend=row["execution_backend"],
         slurm_job_id=row["slurm_job_id"],
-    )
-
-
-def _sub_judge_from_row(row: sqlite3.Row) -> SubJudge:
-    return SubJudge(
-        id=row["id"],
-        backend=SubJudgeBackend(row["backend"]),
-        task_ids=json.loads(row["task_ids_json"]),
-        max_gpus=row["max_gpus"],
-        judge_revision=row["judge_revision"],
-        registered_at=row["registered_at"],
     )

@@ -1,302 +1,200 @@
+import json
 import tempfile
 import unittest
-from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from judge.database import (
-    append_remote_event,
-    create_remote_job,
-    get_job,
-    mark_remote_event_reported,
-    migrate_database,
-    next_unreported_event,
-    register_sub_judge,
-)
-from judge.models import (
-    JobStatus,
-    JudgeResult,
-    RemoteEvent,
-    RemoteEventKind,
-    SubJudge,
-    SubJudgeBackend,
-    Submission,
-)
-from judge.remote_reporter import publish_event, run_reporter
+from judge.models import JudgeResult, Resources, Submission
+from judge.remote_reporter import publish_report
+from judge.ssh import RemoteConfig, RemoteRequest, RemoteSnapshot
 
 
 class RemoteReportingTests(unittest.TestCase):
-    def setUp(self) -> None:
+    def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.path = Path(temporary.name) / "judge.db"
-        migrate_database(self.path)
-        register_sub_judge(
-            self.path,
-            SubJudge(
-                id="nano4",
-                backend=SubJudgeBackend.SLURM,
-                task_ids=["lab1"],
-                max_gpus=8,
-                judge_revision="test",
-                registered_at=datetime.now(UTC),
-            ),
+        self.root = Path(temporary.name)
+        (self.root / ".netrc").write_text(
+            "machine api.wandb.ai login judge password remote-test-key\n"
         )
-        self.job = create_remote_job(
-            self.path,
-            Submission(
+        self.request = RemoteRequest(
+            job_id="1" * 32,
+            submission=Submission(
                 repo_url="https://github.com/example/repo.git",
                 commit_sha="a" * 40,
-                task_id="lab1",
-                github_actor="participant",
+                task_id="lab2",
+                github_actor="student",
             ),
-            judge_id="nano4",
-            request_key="request-1",
+            config=RemoteConfig(host="nano4", user="judge", work_root=str(self.root)),
+            resources=Resources(gpus=1),
         )
+        self.workspace = self.root / "jobs" / self.request.job_id
+        self.output = self.workspace / "output"
+        self.output.mkdir(parents=True)
+        self.record: dict = {"state": "preparing"}
+        self.wandb_run = Mock(url="https://wandb.ai/entity/project/runs/test")
+        self.wandb_run.summary = {}
+        init = patch("judge.remote_reporter.wandb.init", return_value=self.wandb_run)
+        self.init = init.start()
+        self.addCleanup(init.stop)
 
-    def event(
-        self,
-        sequence: int,
-        kind: RemoteEventKind,
-        *,
-        line: str | None = None,
-        result: JudgeResult | None = None,
-        error: str | None = None,
-    ) -> RemoteEvent:
-        return RemoteEvent(
-            sequence=sequence,
-            kind=kind,
-            slurm_job_id="12345",
-            line=line,
-            result=result,
-            error=error,
-        )
+    def publish(self, snapshot=None):
+        snapshot = snapshot or RemoteSnapshot()
+        publish_report(self.request, snapshot, self.workspace, self.record)
+        return snapshot
 
-    def test_ordered_events_are_idempotent_and_change_job_state(self) -> None:
-        started = self.event(1, RemoteEventKind.STARTED)
-        running = append_remote_event(self.path, "nano4", self.job.id, started)
-        self.assertEqual(running.status, JobStatus.RUNNING)
-        self.assertEqual(running.slurm_job_id, "12345")
-        self.assertEqual(
-            append_remote_event(self.path, "nano4", self.job.id, started), running
-        )
-        with self.assertRaisesRegex(ValueError, "Expected event sequence 2"):
-            append_remote_event(
-                self.path,
-                "nano4",
-                self.job.id,
-                self.event(3, RemoteEventKind.LOG, line="skipped"),
+    def test_uses_remote_netrc_and_reports_setup_failure_without_slurm(self):
+        snapshot = self.publish(RemoteSnapshot(error="uv sync failed"))
+        self.assertEqual(self.wandb_run.summary["error"], "uv sync failed")
+        self.assertEqual(self.wandb_run.summary["judge_status"], "error")
+        self.assertTrue(self.record["report"]["complete"])
+        self.assertEqual(snapshot.wandb_url, self.wandb_run.url)
+        settings = self.init.call_args.kwargs["settings"]
+        self.assertEqual(settings.api_key, "remote-test-key")
+        self.assertEqual(settings.finish_timeout, 30)
+        self.assertTrue(settings.finish_timeout_raises)
+        self.assertEqual(settings.console, "wrap")
+        self.assertEqual(self.init.call_args.kwargs["id"], self.request.job_id)
+        self.assertNotIn("api_key", self.init.call_args.kwargs["config"])
+        self.wandb_run.finish.assert_called_with(exit_code=1)
+        self.assertEqual(self.finish_flags(), [False, True])
+
+    def finish_flags(self):
+        return [
+            call.kwargs["settings"].x_update_finish_state
+            for call in self.init.call_args_list
+        ]
+
+    def test_running_reports_and_idle_heartbeats_never_finish_server_run(self):
+        self.publish()
+        self.assertEqual(self.wandb_run.summary["judge_status"], "running")
+        self.assertFalse(self.record["report"].get("complete"))
+        self.publish(RemoteSnapshot(slurm_job_id="123", slurm_state="PENDING"))
+        self.publish(RemoteSnapshot(slurm_job_id="123", slurm_state="RUNNING"))
+        with patch("builtins.print") as output:
+            self.publish(RemoteSnapshot(slurm_job_id="123", slurm_state="RUNNING"))
+        output.assert_not_called()
+        self.assertEqual(self.finish_flags(), [False] * 4)
+        self.assertEqual(self.wandb_run.summary["slurm_job_id"], "123")
+        for call in self.init.call_args_list:
+            self.assertEqual(call.kwargs["id"], self.request.job_id)
+            self.assertEqual(call.kwargs["resume"], "allow")
+            self.assertEqual(call.kwargs["reinit"], "create_new")
+
+    def test_missing_or_wrong_credentials_never_prompt(self):
+        (self.root / ".netrc").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.publish()
+        (self.root / ".netrc").write_text("machine unrelated.example password wrong")
+        with self.assertRaisesRegex(ValueError, "api.wandb.ai"):
+            self.publish()
+        self.init.assert_not_called()
+
+    def test_report_offsets_advance_only_after_upload_and_do_not_repeat_logs(self):
+        text = "模型完成\n"
+        (self.output / "setup.log").write_text(text)
+        self.wandb_run.finish.side_effect = RuntimeError("network disconnected")
+        with self.assertRaisesRegex(RuntimeError, "disconnected"):
+            self.publish()
+        self.assertNotIn("report", self.record)
+        self.assertEqual(self.finish_flags(), [False])
+        self.wandb_run.finish.side_effect = None
+        with patch("builtins.print") as output:
+            self.publish()
+        self.assertEqual(self.record["report"]["setup_offset"], len(text.encode()))
+        output.assert_any_call(text, end="", flush=True)
+        self.init.reset_mock()
+        with patch("builtins.print") as output:
+            self.publish()
+        output.assert_not_called()
+        self.assertEqual(self.finish_flags(), [False])
+
+    def test_large_remote_log_drains_before_final_result_and_does_not_return_text(self):
+        (self.output / "slurm.log").write_text("x" * 70000)
+        (self.output / "result.json").write_text('{"passed":true}')
+        self.record["state"] = "submitted"
+        snapshot = RemoteSnapshot(slurm_job_id="123", result=JudgeResult(passed=True))
+        with (
+            patch("judge.remote_reporter._publish_result") as publish,
+            patch("builtins.print"),
+        ):
+            first = self.publish(snapshot)
+            self.assertTrue(first.report_pending)
+            self.assertFalse(self.record["report"].get("complete"))
+            self.assertEqual(self.finish_flags(), [False])
+            publish.assert_not_called()
+            second = self.publish(
+                RemoteSnapshot(slurm_job_id="123", result=snapshot.result)
             )
-        with self.assertRaisesRegex(ValueError, "different data"):
-            append_remote_event(
-                self.path,
-                "nano4",
-                self.job.id,
-                self.event(1, RemoteEventKind.LOG, line="changed"),
-            )
-        append_remote_event(
-            self.path,
-            "nano4",
-            self.job.id,
-            self.event(2, RemoteEventKind.LOG, line="training\n"),
-        )
-        finished = append_remote_event(
-            self.path,
-            "nano4",
-            self.job.id,
-            self.event(3, RemoteEventKind.COMPLETED, result=JudgeResult(passed=True)),
-        )
-        self.assertEqual(finished.status, JobStatus.COMPLETED)
-        self.assertTrue(finished.result and finished.result.passed)
-        with self.assertRaisesRegex(ValueError, "not running"):
-            append_remote_event(
-                self.path,
-                "nano4",
-                self.job.id,
-                self.event(4, RemoteEventKind.LOG, line="late"),
-            )
+            self.assertFalse(second.report_pending)
+            publish.assert_called_once()
+            self.assertEqual(self.finish_flags(), [False, False, True])
+            self.wandb_run.finish.assert_called_with(exit_code=0)
+        self.assertEqual(first.slurm_log, "")
+        self.assertTrue(self.record["report"]["complete"])
+        self.init.reset_mock()
+        self.publish(RemoteSnapshot(result=snapshot.result))
+        self.init.assert_not_called()
 
-    def test_report_cursor_delivers_each_event_in_order(self) -> None:
-        append_remote_event(
-            self.path, "nano4", self.job.id, self.event(1, RemoteEventKind.STARTED)
-        )
-        append_remote_event(
-            self.path,
-            "nano4",
-            self.job.id,
-            self.event(2, RemoteEventKind.FAILED, error="ValueError: bad model"),
-        )
-        first = next_unreported_event(self.path)
-        assert first is not None
-        self.assertEqual(first[1].sequence, 1)
-        mark_remote_event_reported(self.path, self.job.id, 1)
-        second = next_unreported_event(self.path)
-        assert second is not None
-        self.assertEqual(second[1].sequence, 2)
-        mark_remote_event_reported(self.path, self.job.id, 2)
-        self.assertIsNone(next_unreported_event(self.path))
-        job = get_job(self.path, self.job.id)
-        assert job is not None
-        self.assertEqual(job.error, "ValueError: bad model")
-
-    def test_reporter_marks_event_only_after_wandb_succeeds(self) -> None:
-        append_remote_event(
-            self.path, "nano4", self.job.id, self.event(1, RemoteEventKind.STARTED)
-        )
+    def test_result_publication_failure_keeps_server_run_open_for_retry(self):
+        snapshot = RemoteSnapshot(result=JudgeResult(passed=True))
         with (
             patch(
-                "judge.remote_reporter.publish_event",
+                "judge.remote_reporter._publish_result",
                 side_effect=RuntimeError("offline"),
             ),
             self.assertRaisesRegex(RuntimeError, "offline"),
         ):
-            run_reporter(
-                database_path=self.path, wandb_project="study-group", once=True
-            )
-        self.assertIsNotNone(next_unreported_event(self.path))
-        with patch("judge.remote_reporter.publish_event", Mock()) as publish:
-            run_reporter(
-                database_path=self.path, wandb_project="study-group", once=True
-            )
-        publish.assert_called_once()
-        self.assertIsNone(next_unreported_event(self.path))
+            self.publish(snapshot)
+        self.assertNotIn("report", self.record)
+        self.assertEqual(self.finish_flags(), [False])
+        with patch("judge.remote_reporter._publish_result"):
+            self.publish(snapshot)
+        self.assertEqual(self.finish_flags(), [False, False, True])
+        self.assertTrue(self.record["report"]["complete"])
 
-    def test_log_event_prints_without_creating_a_wandb_property(self) -> None:
-        run = Mock()
-        run.id = self.job.id
-        run.url = "https://wandb.ai/example/run"
-        run.summary = {}
+    def test_finalization_failure_retries_same_run_without_acknowledging_cursors(self):
+        (self.output / "slurm.log").write_text("job finished\n")
+        snapshot = RemoteSnapshot(result=JudgeResult(passed=True))
+        self.wandb_run.finish.side_effect = [None, RuntimeError("disconnected")]
         with (
-            patch("judge.remote_reporter.wandb.init", return_value=run),
-            patch("judge.remote_reporter.set_wandb_run"),
-            patch("builtins.print") as output,
+            patch("judge.remote_reporter._publish_result"),
+            self.assertRaisesRegex(RuntimeError, "disconnected"),
         ):
-            publish_event(
-                self.job,
-                self.event(1, RemoteEventKind.LOG, line="training\n"),
-                database_path=self.path,
-                wandb_project="study-group",
-                wandb_entity=None,
-                active_runs={},
-            )
+            self.publish(snapshot)
+        self.assertNotIn("report", self.record)
+        self.wandb_run.finish.side_effect = None
+        with patch("judge.remote_reporter._publish_result"):
+            self.publish(snapshot)
+        self.assertEqual(self.finish_flags(), [False, True, False, True])
+        self.assertTrue(self.record["report"]["complete"])
 
-        output.assert_called_once_with("training\n", end="", flush=True)
-        run.log.assert_not_called()
-        run.finish.assert_not_called()
-        self.assertEqual(run.summary["judge_status"], "running")
-
-    def publish(self, job, event, active_runs) -> None:
-        publish_event(
-            job,
-            event,
-            database_path=self.path,
-            wandb_project="study-group",
-            wandb_entity=None,
-            active_runs=active_runs,
+    def test_restart_resumes_heartbeat_from_durable_progress(self):
+        self.publish(RemoteSnapshot(slurm_job_id="123", slurm_state="RUNNING"))
+        self.record = json.loads(json.dumps(self.record))
+        self.init.reset_mock()
+        restarted_run = Mock(url=self.wandb_run.url, summary={})
+        self.init.return_value = restarted_run
+        snapshot = self.publish(
+            RemoteSnapshot(slurm_job_id="123", slurm_state="RUNNING")
         )
+        self.assertEqual(snapshot.wandb_url, self.wandb_run.url)
+        self.assertEqual(restarted_run.summary["judge_status"], "running")
+        self.assertEqual(self.finish_flags(), [False])
 
-    def test_run_stays_running_until_result_is_published(self) -> None:
-        run = Mock(id=self.job.id, url="https://wandb.ai/example/run", summary={})
-        active_runs = {}
-        with (
-            patch("judge.remote_reporter.wandb.init", return_value=run) as init,
-            patch("judge.remote_reporter.set_wandb_run"),
-            patch("judge.remote_reporter._publish_result") as publish_result,
-        ):
-            self.publish(self.job, self.event(1, RemoteEventKind.STARTED), active_runs)
-            self.assertEqual(run.summary["judge_status"], "running")
-            run.finish.assert_not_called()
-            self.publish(
-                self.job,
-                self.event(2, RemoteEventKind.LOG, line="training"),
-                active_runs,
-            )
-            run.finish.assert_not_called()
-            self.publish(
-                self.job,
-                self.event(
-                    3, RemoteEventKind.COMPLETED, result=JudgeResult(passed=True)
-                ),
-                active_runs,
-            )
-
-        init.assert_called_once()
-        self.assertEqual(init.call_args.kwargs["reinit"], "create_new")
-        publish_result.assert_called_once()
-        run.finish.assert_called_once_with(exit_code=0)
-        self.assertEqual(active_runs, {})
-
-    def test_concurrent_jobs_keep_separate_active_runs(self) -> None:
-        other_job = self.job.model_copy(update={"id": "other-job"})
-        runs = [
-            Mock(id=job.id, url="https://wandb.ai/example/run", summary={})
-            for job in (self.job, other_job)
-        ]
-        active_runs = {}
-        with (
-            patch("judge.remote_reporter.wandb.init", side_effect=runs) as init,
-            patch("judge.remote_reporter.set_wandb_run"),
-        ):
-            for job in (self.job, other_job):
-                self.publish(job, self.event(1, RemoteEventKind.STARTED), active_runs)
-            self.publish(
-                self.job,
-                self.event(2, RemoteEventKind.FAILED, error="bad model"),
-                active_runs,
-            )
-
-        self.assertEqual(init.call_count, 2)
-        self.assertEqual(active_runs, {other_job.id: runs[1]})
-        runs[0].finish.assert_called_once_with(exit_code=1)
-        self.assertEqual(runs[0].summary["judge_status"], "error")
-        runs[1].finish.assert_not_called()
-
-    def test_reporting_failure_keeps_run_open_for_retry(self) -> None:
-        run = Mock(id=self.job.id, url="https://wandb.ai/example/run", summary={})
-        active_runs = {}
-        event = self.event(
-            2, RemoteEventKind.COMPLETED, result=JudgeResult(passed=True)
+    def test_concurrent_jobs_use_separate_run_ids_without_finishing_each_other(self):
+        self.publish()
+        other = self.request.model_copy(update={"job_id": "2" * 32})
+        other_workspace = self.root / "jobs" / other.job_id
+        (other_workspace / "output").mkdir(parents=True)
+        other_run = Mock(url="https://wandb.ai/entity/project/runs/other", summary={})
+        self.init.return_value = other_run
+        other_record: dict = {"state": "preparing"}
+        publish_report(other, RemoteSnapshot(), other_workspace, other_record)
+        self.assertEqual(
+            [call.kwargs["id"] for call in self.init.call_args_list],
+            [self.request.job_id, other.job_id],
         )
-        with (
-            patch("judge.remote_reporter.wandb.init", return_value=run) as init,
-            patch("judge.remote_reporter.set_wandb_run"),
-            patch(
-                "judge.remote_reporter._publish_result",
-                side_effect=[RuntimeError("offline"), None],
-            ),
-        ):
-            self.publish(self.job, self.event(1, RemoteEventKind.STARTED), active_runs)
-            with self.assertRaisesRegex(RuntimeError, "offline"):
-                self.publish(self.job, event, active_runs)
-            run.finish.assert_not_called()
-            self.assertEqual(active_runs, {self.job.id: run})
-            self.publish(self.job, event, active_runs)
-
-        init.assert_called_once()
-        run.finish.assert_called_once_with(exit_code=0)
-        self.assertEqual(active_runs, {})
-
-    def test_reporter_reuses_run_across_durable_events(self) -> None:
-        for event in (
-            self.event(1, RemoteEventKind.STARTED),
-            self.event(2, RemoteEventKind.LOG, line="training"),
-            self.event(3, RemoteEventKind.COMPLETED, result=JudgeResult(passed=True)),
-        ):
-            append_remote_event(self.path, "nano4", self.job.id, event)
-        run = Mock(id=self.job.id, url="https://wandb.ai/example/run", summary={})
-        with (
-            patch("judge.remote_reporter.wandb.init", return_value=run) as init,
-            patch("judge.worker.wandb.Artifact"),
-        ):
-            run_reporter(
-                database_path=self.path, wandb_project="study-group", once=True
-            )
-
-        init.assert_called_once()
-        self.assertEqual(run.summary["judge_status"], "completed")
-        run.finish.assert_called_once_with(exit_code=0)
-        self.assertIsNone(next_unreported_event(self.path))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(self.finish_flags(), [False, False])
+        self.assertFalse(self.record["report"].get("complete"))
+        self.assertFalse(other_record["report"].get("complete"))

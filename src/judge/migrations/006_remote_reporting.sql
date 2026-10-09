@@ -1,0 +1,1 @@
+ALTER TABLE ssh_jobs ADD COLUMN report_pending INTEGER NOT NULL DEFAULT 0;

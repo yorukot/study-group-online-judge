@@ -11,6 +11,7 @@ dependencies = [
     "datasets>=4.3,<5",
     "fastapi[standard]>=0.141.1",
     "pydantic>=2.13.5",
+    "playwright>=1.58,<2",
     "python-dotenv>=1.2.3",
     "safetensors>=0.7,<1",
     "torch>=2.10,<2.12",

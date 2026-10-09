@@ -1,5 +1,6 @@
 {
   "lab1": "Implementing GPT-2",
   "lab2": "MMLU Evaluation Harness",
-  "lab4": "Training GPT-2 from Scratch"
+  "lab4": "Training GPT-2 from Scratch",
+  "lab5": "Training Llama 3.2 from Scratch"
 }

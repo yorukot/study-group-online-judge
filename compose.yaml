@@ -1,18 +1,33 @@
 name: study-group-online-judge
 
+x-judge: &judge
+  image: study-group-online-judge:local
+  pull_policy: build
+  build:
+    context: .
+    target: judge
+  init: true
+  restart: unless-stopped
+
 services:
   api:
-    image: ghcr.io/cerulean-works/study-group-online-judge:main
-    pull_policy: always
-    init: true
-    restart: unless-stopped
+    <<: *judge
     environment:
       JUDGE_API_TOKEN: ${JUDGE_API_TOKEN:?JUDGE_API_TOKEN must be set}
-      JUDGE_AGENT_TOKEN: ${JUDGE_AGENT_TOKEN:-}
+      JUDGE_SSH_HOST: ${JUDGE_SSH_HOST:?Set the remote judge Tailscale hostname}
+      JUDGE_SSH_USER: ${JUDGE_SSH_USER:?Set the remote Unix user}
+      JUDGE_REMOTE_WORK_ROOT: ${JUDGE_REMOTE_WORK_ROOT:?Set the remote shared work directory}
+      JUDGE_REPO_URL: ${JUDGE_REPO_URL:-https://github.com/cerulean-works/study-group-online-judge.git}
+      JUDGE_SLURM_ACCOUNT: ${JUDGE_SLURM_ACCOUNT:-ACD115198}
+      JUDGE_SLURM_GPU_RESOURCE: ${JUDGE_SLURM_GPU_RESOURCE:-gpu}
       WANDB_API_KEY: ${WANDB_API_KEY:?WANDB_API_KEY must be set}
       WANDB_ENTITY: ${WANDB_ENTITY:-cerulean-labs}
       WANDB_PROJECT: ${WANDB_PROJECT:-study-group-labs}
       JUDGE_SLACK_WEBHOOK_URL: ${JUDGE_SLACK_WEBHOOK_URL:-}
+      JUDGE_SLACK_BOT_TOKEN: ${JUDGE_SLACK_BOT_TOKEN:-}
+      JUDGE_SLACK_CHANNEL_ID: ${JUDGE_SLACK_CHANNEL_ID:-}
+      JUDGE_SLACK_DAILY_TIME: ${JUDGE_SLACK_DAILY_TIME:-19:00}
+      JUDGE_SLACK_TIMEZONE: ${JUDGE_SLACK_TIMEZONE:-Asia/Taipei}
       JUDGE_LEADERBOARD_REFRESH_SECONDS: ${JUDGE_LEADERBOARD_REFRESH_SECONDS:-60}
     volumes:
       - judge-data:/data
@@ -32,13 +47,10 @@ services:
       start_period: 5s
 
   worker:
-    image: ghcr.io/cerulean-works/study-group-online-judge:main
-    pull_policy: always
-    init: true
-    restart: unless-stopped
+    <<: *judge
     command: ["python", "-m", "judge.worker"]
     environment:
-      JUDGE_RUNNER_IMAGE: ghcr.io/cerulean-works/study-group-online-judge:main
+      JUDGE_RUNNER_IMAGE: study-group-online-judge:local
       JUDGE_WORK_ROOT: ${JUDGE_WORK_ROOT:?JUDGE_WORK_ROOT must be set}
       JUDGE_HF_CACHE_VOLUME: study-group-online-judge-hf-cache
       JUDGE_UV_CACHE_VOLUME: study-group-online-judge-uv-cache
@@ -60,22 +72,55 @@ services:
         source: /var/run/docker.sock
         target: /var/run/docker.sock
 
-  remote-reporter:
-    image: ghcr.io/cerulean-works/study-group-online-judge:main
-    pull_policy: always
-    init: true
+  tailscale:
+    image: tailscale/tailscale:latest
     restart: unless-stopped
-    command: ["python", "-m", "judge.remote_reporter"]
+    # Give the root daemon an operator matching the worker's UID. Alpine's
+    # passwd database is local to this pre-built container.
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if ! id judge >/dev/null 2>&1; then
+          addgroup -g 10001 judge
+          adduser -D -u 10001 -G judge judge
+        fi
+        exec /usr/local/bin/containerboot
     environment:
-      WANDB_API_KEY: ${WANDB_API_KEY:?WANDB_API_KEY must be set}
-      WANDB_DIR: /data/wandb
-      WANDB_ENTITY: ${WANDB_ENTITY:-cerulean-labs}
-      WANDB_MODE: ${WANDB_MODE:-online}
-      WANDB_PROJECT: ${WANDB_PROJECT:-study-group-labs}
+      TS_AUTHKEY: ${TS_AUTHKEY:?Set a Tailscale auth key}
+      TS_AUTH_ONCE: "true"
+      TS_HOSTNAME: ${TS_HOSTNAME:-study-group-online-judge}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      TS_USERSPACE: "true"
+      TS_EXTRA_ARGS: --operator=judge
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - tailscale-socket:/var/run/tailscale
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          tailscale status --json | grep -q '"BackendState": "Running"'
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  ssh-worker:
+    <<: *judge
+    command: ["python", "-m", "judge.ssh_worker"]
+    depends_on:
+      tailscale:
+        condition: service_healthy
+    environment:
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
     volumes:
       - judge-data:/data
+      - tailscale-socket:/var/run/tailscale
 
 volumes:
+  tailscale-state:
+  tailscale-socket:
   judge-data:
   hf-cache:
     name: study-group-online-judge-hf-cache

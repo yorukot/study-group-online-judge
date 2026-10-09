@@ -5,13 +5,16 @@ import logging
 import math
 import os
 import traceback
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep
 from typing import NotRequired, TypedDict
-from urllib.parse import urlsplit
+from urllib.error import HTTPError
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
+from judge.leaderboard_images import render_standings
 from judge.tasks import TASKS
 
 # Inherit Uvicorn's configured handlers and level so INFO reaches container logs.
@@ -25,6 +28,7 @@ def safe_traceback(error: Exception) -> str:
         "JUDGE_API_TOKEN",
         "JUDGE_AGENT_TOKEN",
         "JUDGE_SLACK_WEBHOOK_URL",
+        "JUDGE_SLACK_BOT_TOKEN",
     ):
         secret = os.getenv(name)
         if secret:
@@ -204,7 +208,7 @@ def new_record(board, previous):
     return leader["score"] > old["score"]
 
 
-def post_slack(webhook, boards, changed):
+def lab_names():
     names_path = Path(
         os.getenv(
             "JUDGE_LAB_NAMES_PATH",
@@ -212,64 +216,195 @@ def post_slack(webhook, boards, changed):
         )
     )
     try:
-        names = json.loads(names_path.read_text())
+        return json.loads(names_path.read_text())
     except OSError, ValueError:
-        names = {}
+        return {}
 
-    def escape(value):
-        return (
-            str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        )
 
-    sections = []
+def escape(value):
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+MEDALS = ("first_place_medal", "second_place_medal", "third_place_medal")
+_next_slack_attempt: dict[str, float] = {}
+
+
+def open_slack(request, workflow, *, timeout=10):
+    """Pace app webhooks at 1/s, workflow triggers at 10/min; honor 429 backoff."""
+    webhook = request.full_url
+    delay = _next_slack_attempt.get(webhook, 0) - monotonic()
+    if delay > 30:
+        raise RuntimeError("Slack rate limit backoff; retrying on a later refresh")
+    if delay > 0:
+        sleep(delay)
+    _next_slack_attempt[webhook] = monotonic() + (6 if workflow else 1)
+    try:
+        return urlopen(request, timeout=timeout)
+    except HTTPError as error:
+        if error.code == 429:
+            try:
+                delay = float(error.headers.get("Retry-After", "60"))
+            except ValueError:
+                delay = 60
+            _next_slack_attempt[webhook] = monotonic() + max(1, delay)
+        raise
+
+
+def slack_api(method, token, payload):
+    request = Request(
+        f"https://slack.com/api/{method}",
+        data=urlencode(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    with open_slack(request, False, timeout=30) as response:
+        result = json.load(response)
+        if not 200 <= response.status < 300 or result.get("ok") is not True:
+            raise RuntimeError(
+                f"Slack {method} failed: {result.get('error', 'unacknowledged')}"
+            )
+        return result
+
+
+def upload_slack_card(token, channel, path, title, blocks):
+    """Upload PNG bytes, then share the file and rankings in one Slack message."""
+    content = path.read_bytes()
+    ticket = slack_api(
+        "files.getUploadURLExternal",
+        token,
+        {
+            "filename": path.name,
+            "length": len(content),
+            "alt_txt": title,
+        },
+    )
+    request = Request(
+        ticket["upload_url"],
+        data=content,
+        headers={"Content-Type": "image/png"},
+        method="POST",
+    )
+    # The upload URL is temporary; the bot token is only sent to Slack API methods.
+    try:
+        with urlopen(request, timeout=30) as response:
+            if response.status != 200:
+                raise RuntimeError("Slack PNG upload failed")
+            response.read()
+    except HTTPError as error:
+        # Do not log the temporary upload URL in exception tracebacks.
+        raise RuntimeError(f"Slack PNG upload failed (HTTP {error.code})") from None
+    slack_api(
+        "files.completeUploadExternal",
+        token,
+        {
+            "files": json.dumps([{"id": ticket["file_id"], "title": title}]),
+            "channel_id": channel,
+            "blocks": json.dumps(blocks),
+        },
+    )
+
+
+def post_slack(
+    webhook,
+    boards,
+    changed,
+    *,
+    daily=False,
+    image_directory=None,
+    first_page=0,
+    on_page_sent=None,
+):
+    """One lab per message, with complete daily standings paged for Slack limits."""
+    names = lab_names()
+    workflow = urlsplit(webhook or "").path.startswith(("/triggers/", "/workflows/"))
+    bot_token = os.getenv("JUDGE_SLACK_BOT_TOKEN")
+    channel = os.getenv("JUDGE_SLACK_CHANNEL_ID")
+    if bot_token or channel:
+        if not bot_token or not channel:
+            raise RuntimeError(
+                "Inline Slack images require JUDGE_SLACK_BOT_TOKEN and JUDGE_SLACK_CHANNEL_ID"
+            )
+        if image_directory is None:
+            raise RuntimeError("Inline Slack images require an image directory")
+    elif not webhook:
+        raise RuntimeError("Slack notification credentials are not configured")
     for board in boards:
-        if board["id"] not in changed or not board["entries"]:
+        if board["id"] not in changed or (not daily and not board["entries"]):
             continue
         label = board["id"].replace("lab", "Lab ", 1)
         name = names.get(board["id"])
         title = f"{label} ({name})" if name else label
-        leader = board["entries"][0]
-        if board["grading_type"] == "score":
-            direction = (
-                "↓ Lower is better"
-                if board["metric_direction"] == "minimize"
-                else "↑ Higher is better"
-            )
-            rule = f"{escape(board['primary_metric'])} · {direction}"
-            result = f"{leader['score']:.6g}"
-        else:
-            rule = "Pass / fail · Earliest passing submission"
-            result = "Passed"
-        sections.append(
-            f"🧪 *{escape(title)}*\n\n{rule}\n🏅 {escape(leader['github_actor'])} — {result}"
+        heading = (
+            "Daily Updates"
+            if daily
+            else f"New record by {escape(board['entries'][0]['github_actor'])}!"
         )
-    text = "*OJ Leaderboard update*\n\n" + "\n\n".join(sections)
-    payload = {
-        "text": text,
-        "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
-    }
-    workflow = urlsplit(webhook).path.startswith(("/triggers/", "/workflows/"))
-    if workflow:
-        payload = {"text": text}
-    request = Request(
-        webhook,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "study-group-online-judge/0.1",
-        },
-        method="POST",
-    )
-    with urlopen(request, timeout=10) as response:
-        body = response.read().strip()
-        acknowledged = body == b"ok"
-        if workflow and not acknowledged:
-            try:
-                acknowledged = json.loads(body).get("ok") is True
-            except ValueError, AttributeError:
-                acknowledged = False
-        if not 200 <= response.status < 300 or not acknowledged:
-            raise RuntimeError("Slack did not acknowledge notification")
+        entries = board["entries"] if daily else board["entries"][:3]
+        pages = [
+            entries[offset : offset + 20] for offset in range(0, len(entries), 20)
+        ] or [[]]
+        for page_number, page in enumerate(pages, 1):
+            if page_number <= first_page:
+                continue
+            page_label = f" · {page_number}/{len(pages)}" if len(pages) > 1 else ""
+            intro = f":test_tube: {heading}"
+            blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": intro}}]
+            lines = []
+            for entry in page:
+                rank = entry["rank"]
+                prefix = f":{MEDALS[rank - 1]}:" if rank <= 3 else f"{rank}."
+                result = (
+                    f"{entry['score']:.7g}" if entry["score"] is not None else "Passed"
+                )
+                line = f"{prefix} {escape(entry['github_actor'])}: {result}"
+                lines.append(line)
+            if not page:
+                lines.append("No ranked participants yet.")
+            standings = f"*{escape(title)}*{page_label}\n" + "\n".join(lines)
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": standings},
+                }
+            )
+            text = intro + "\n\n" + standings
+            if bot_token and image_directory is not None:
+                filename = render_standings(board, page, image_directory)
+                upload_slack_card(
+                    bot_token,
+                    channel,
+                    image_directory / filename,
+                    title + page_label,
+                    blocks,
+                )
+                if on_page_sent is not None:
+                    on_page_sent(page_number)
+                continue
+            payload = {"text": text} if workflow else {"text": text, "blocks": blocks}
+            request = Request(
+                webhook,
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "study-group-online-judge/0.1",
+                },
+                method="POST",
+            )
+            with open_slack(request, workflow) as response:
+                body = response.read().strip()
+                acknowledged = body == b"ok"
+                if workflow and not acknowledged:
+                    try:
+                        acknowledged = json.loads(body).get("ok") is True
+                    except ValueError, AttributeError:
+                        acknowledged = False
+                if not 200 <= response.status < 300 or not acknowledged:
+                    raise RuntimeError("Slack did not acknowledge notification")
+            if on_page_sent is not None:
+                on_page_sent(page_number)
 
 
 class LeaderboardService:
@@ -283,6 +418,13 @@ class LeaderboardService:
             "error": None,
             "labs": rank_submissions([]),
         }
+        self.image_directory = database_path.parent / "leaderboard-images"
+        self.daily_time = time.fromisoformat(
+            os.getenv("JUDGE_SLACK_DAILY_TIME", "19:00")
+        )
+        self.timezone = ZoneInfo(os.getenv("JUDGE_SLACK_TIMEZONE", "Asia/Taipei"))
+        self.daily_notified = {}
+        self.daily_pending = {}
         self.notified = None
         if self.state_path.exists():
             try:
@@ -290,6 +432,8 @@ class LeaderboardService:
                 if saved["snapshot"]["source"] == self.source:
                     self.snapshot = saved["snapshot"]
                     self.notified = saved["notified"]
+                    self.daily_notified = saved.get("daily_notified", {})
+                    self.daily_pending = saved.get("daily_pending", {})
             except ValueError, KeyError:
                 pass
 
@@ -342,6 +486,7 @@ class LeaderboardService:
             for board in boards
         }
         webhook = os.getenv("JUDGE_SLACK_WEBHOOK_URL")
+        notifications_enabled = webhook or os.getenv("JUDGE_SLACK_BOT_TOKEN")
         changed = [
             board["id"]
             for board in boards
@@ -351,20 +496,76 @@ class LeaderboardService:
         if self.notified is None:
             self.notified = current  # Initial sync seeds the all-time best baseline.
         elif changed:
-            try:
-                if webhook:
-                    post_slack(webhook, boards, changed)
-            except Exception:  # noqa: BLE001 - retain the record for delivery retry
-                self.snapshot["notification_error"] = (
-                    "Slack delivery failed; retrying on the next refresh."
-                )
-            else:
-                for task_id in changed:
+            for task_id in changed:
+                try:
+                    if notifications_enabled:
+                        post_slack(
+                            webhook,
+                            boards,
+                            [task_id],
+                            image_directory=self.image_directory,
+                        )
+                except Exception as error:  # noqa: BLE001 - retry delivery
+                    self.notification_failed(error)
+                else:
                     self.notified[task_id] = current[task_id]
+                    self.persist()
+        now = datetime.now(self.timezone)
+        today = now.date().isoformat()
+        if notifications_enabled and now.time() >= self.daily_time:
+            for board in boards:
+                if self.daily_notified.get(board["id"]) == today:
+                    continue
+                task_id = board["id"]
+                if self.daily_pending.get(task_id, {}).get("date") != today:
+                    self.daily_pending[task_id] = {
+                        "date": today,
+                        "board": board,
+                        "next_page": 0,
+                    }
+                    self.persist()
+                pending = self.daily_pending[task_id]
+
+                def page_sent(page_number, pending=pending):
+                    pending["next_page"] = page_number
+                    self.persist()
+
+                try:
+                    post_slack(
+                        webhook,
+                        [pending["board"]],
+                        [task_id],
+                        daily=True,
+                        image_directory=self.image_directory,
+                        first_page=pending["next_page"],
+                        on_page_sent=page_sent,
+                    )
+                except Exception as error:  # noqa: BLE001 - retry delivery
+                    self.notification_failed(error)
+                else:
+                    self.daily_notified[task_id] = today
+                    del self.daily_pending[task_id]
+                    self.persist()
         # Ties, lower-ranked changes, and deleted runs never lower the record.
+        self.persist()
+
+    def notification_failed(self, error):
+        self.snapshot["notification_error"] = (
+            "Slack delivery failed; retrying on the next refresh."
+        )
+        logger.error("Slack notification failed\n%s", safe_traceback(error))
+
+    def persist(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_path.with_suffix(".tmp")
         temporary.write_text(
-            json.dumps({"snapshot": self.snapshot, "notified": self.notified})
+            json.dumps(
+                {
+                    "snapshot": self.snapshot,
+                    "notified": self.notified,
+                    "daily_notified": self.daily_notified,
+                    "daily_pending": self.daily_pending,
+                }
+            )
         )
         temporary.replace(self.state_path)

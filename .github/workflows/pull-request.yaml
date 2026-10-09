@@ -85,5 +85,11 @@ jobs:
       - name: Install Dependencies
         run: uv sync --all-extras --dev --frozen
 
+      - name: Build leaderboard UI
+        run: npm ci --prefix ui && npm run build --prefix ui
+
+      - name: Install screenshot browser
+        run: uv run playwright install --with-deps --only-shell chromium
+
       - name: Run tests
         run: uv run python -m pytest -q tests

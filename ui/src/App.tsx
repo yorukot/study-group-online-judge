@@ -95,7 +95,9 @@ export default function App() {
                 const snapshot: Snapshot = await response.json();
                 setData(snapshot);
                 setSelected(
-                    (previous) => previous || snapshot.labs[0]?.id || "",
+                    (previous) => previous || [...snapshot.labs].sort(
+                        (a, b) => b.id.localeCompare(a.id, undefined, { numeric: true }),
+                    )[0]?.id || "",
                 );
                 setError("");
             } catch (e) {
