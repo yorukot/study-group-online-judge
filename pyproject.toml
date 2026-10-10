@@ -14,10 +14,10 @@ dependencies = [
     "playwright>=1.58,<2",
     "python-dotenv>=1.2.3",
     "safetensors>=0.7,<1",
-    "torch>=2.10,<2.12",
+    "torch>=2.14",
     "tqdm>=4.70.1",
-    "transformers[torch]>=4.57,<5",
     "wandb>=0.30.0,<0.31",
+    "transformers>=5.19.0",
 ]
 
 [dependency-groups]
