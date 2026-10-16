@@ -31,6 +31,15 @@ class SetupRepoTests(unittest.TestCase):
         self.git("commit", "-am", "second")
         self.second_revision = self.git("rev-parse", "HEAD").stdout.strip()
         self.destination = self.root / "checkout with spaces"
+        self.trusted = self.root / "trusted judge"
+        (self.trusted / "src/judge").mkdir(parents=True)
+        (self.trusted / "pyproject.toml").write_text("[project]\n")
+        (self.trusted / "src/judge/check_runtime.py").write_text(
+            "from pathlib import Path\nimport os, sys\n"
+            "assert Path('.venv/runtime-install').exists()\n"
+            "Path('.venv/import-check').write_text('checked')\n"
+            "sys.exit(int(os.environ.get('FAKE_IMPORT_EXIT', '0')))\n"
+        )
         binary = self.root / "bin"
         binary.mkdir()
         uv = binary / "uv"
@@ -38,6 +47,24 @@ class SetupRepoTests(unittest.TestCase):
             f"#!{sys.executable}\n"
             "from pathlib import Path\n"
             "import os, sys\n"
+            "if sys.argv[1:3] == ['pip', 'freeze']:\n"
+            "    python = str(Path(os.environ['JUDGE_TRUSTED_ROOT']) / '.venv/bin/python')\n"
+            "    assert sys.argv[1:] == ['pip', 'freeze', '--python', python, '--exclude-editable', '--exclude', 'study-group-online-judge']\n"
+            "    print('transformers==5.19.0')\n"
+            "    sys.exit(int(os.environ.get('FAKE_FREEZE_EXIT', '0')))\n"
+            "if sys.argv[1:3] == ['pip', 'check']:\n"
+            "    assert sys.argv[1:] == ['pip', 'check', '--python', '.venv/bin/python']\n"
+            "    assert Path('.venv/runtime-install').exists()\n"
+            "    sys.exit(int(os.environ.get('FAKE_CHECK_EXIT', '0')))\n"
+            "if sys.argv[1:3] == ['pip', 'install']:\n"
+            "    requirements = str(Path(os.environ['JUDGE_TRUSTED_ROOT']) / 'pyproject.toml')\n"
+            "    assert sys.argv[1:7] == ['pip', 'install', '--python', '.venv/bin/python', '--requirements', requirements]\n"
+            "    assert sys.argv[7] == '--constraints'\n"
+            "    assert Path(sys.argv[8]).read_text() == 'transformers==5.19.0\\n'\n"
+            "    Path('.venv/constraints-path').write_text(sys.argv[8])\n"
+            "    assert Path('.venv/bin/python').exists()\n"
+            "    Path('.venv/runtime-install').write_text('installed')\n"
+            "    sys.exit(int(os.environ.get('FAKE_RUNTIME_EXIT', '0')))\n"
             "assert sys.argv[1:] == ['sync', '--no-sources', '--no-dev']\n"
             "assert not any(os.environ.get(name) for name in ['WANDB_API_KEY', 'TS_AUTHKEY', 'JUDGE_API_TOKEN'])\n"
             "Path('.venv').mkdir(exist_ok=True)\n"
@@ -65,6 +92,7 @@ class SetupRepoTests(unittest.TestCase):
             WANDB_API_KEY="test-secret",
             TS_AUTHKEY="test-secret",
             JUDGE_API_TOKEN="test-secret",
+            JUDGE_TRUSTED_ROOT=str(self.trusted),
         )
 
     def git(self, *arguments, cwd=None):
@@ -111,6 +139,58 @@ class SetupRepoTests(unittest.TestCase):
         updated = self.setup(self.second_revision)
         self.assertEqual(updated.returncode, 0, updated.stderr)
         self.assertEqual((self.destination / "solution.txt").read_text(), "second\n")
+
+    def test_lab5_installs_and_checks_complete_trusted_runtime(self):
+        self.environment["JUDGE_TASK_ID"] = "lab5"
+        result = self.setup()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.destination / ".venv/runtime-install").is_file())
+        self.assertTrue((self.destination / ".venv/import-check").is_file())
+        constraints = Path((self.destination / ".venv/constraints-path").read_text())
+        self.assertFalse(constraints.exists())
+        self.assertEqual((self.destination / "uv.lock").read_text(), "submitted lock\n")
+        self.assertEqual(
+            self.git("status", "--porcelain", cwd=self.destination).stdout, ""
+        )
+
+    def test_other_labs_do_not_install_runtime_overlay(self):
+        self.environment["JUDGE_TASK_ID"] = "lab4"
+        result = self.setup()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.destination / ".venv/runtime-install").exists())
+
+    def test_runtime_install_failure_propagates_and_restores_submission_lock(self):
+        self.environment.update(JUDGE_TASK_ID="lab5", FAKE_RUNTIME_EXIT="1")
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.destination / "uv.lock").read_text(), "submitted lock\n")
+
+    def test_freeze_failure_stops_before_runtime_install_and_restores_lock(self):
+        self.environment.update(JUDGE_TASK_ID="lab5", FAKE_FREEZE_EXIT="1")
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.destination / ".venv/runtime-install").exists())
+        self.assertEqual((self.destination / "uv.lock").read_text(), "submitted lock\n")
+
+    def test_dependency_check_failure_stops_before_import_and_restores_lock(self):
+        self.environment.update(JUDGE_TASK_ID="lab5", FAKE_CHECK_EXIT="1")
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.destination / ".venv/import-check").exists())
+        self.assertEqual((self.destination / "uv.lock").read_text(), "submitted lock\n")
+
+    def test_import_failure_propagates_and_restores_submission_lock(self):
+        self.environment.update(JUDGE_TASK_ID="lab5", FAKE_IMPORT_EXIT="1")
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.destination / "uv.lock").read_text(), "submitted lock\n")
+
+    def test_lab5_requires_explicit_trusted_requirements(self):
+        self.environment["JUDGE_TASK_ID"] = "lab5"
+        self.environment.pop("JUDGE_TRUSTED_ROOT")
+        result = self.setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted evaluator directory is required", result.stderr)
 
     def advance_default_branch(self):
         self.git("branch", "-m", "new-default")

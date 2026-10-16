@@ -13,21 +13,15 @@ from judge.tasks.lab4 import Lab4
 from judge.tasks.lab5 import Lab5
 
 
-def test_lab5_selects_tail_after_full_shuffle():
-    dataset = Dataset.from_dict({"text": [str(i) for i in range(60_000)]})
+def test_lab5_preserves_prepared_dataset_without_shuffle_or_selection():
+    dataset = Dataset.from_dict({"text": [str(i) for i in range(50_000)]})
     with patch("judge.tasks.lab5.load_dataset", return_value=dataset) as load:
         selected = Lab5().load_dataset()
-    load.assert_called_once_with("allenai/dolma3_mix-150B-1025", split="train")
+    load.assert_called_once_with(
+        "cerulean-works/study-group-lab5-eval", None, split="train"
+    )
     assert len(selected) == 50_000
-    expected = dataset.shuffle(seed=42).select(range(10_000, 60_000))
-    assert selected["text"] == expected["text"]
-    assert (
-        selected["text"]
-        != dataset.select(range(10_000, 60_000)).shuffle(seed=42)["text"]
-    )
-    assert not set(selected["text"]) & set(
-        dataset.shuffle(seed=42).select(range(10_000))["text"]
-    )
+    assert selected is dataset
 
 
 def test_lab5_rejects_insufficient_documents():
@@ -36,7 +30,7 @@ def test_lab5_rejects_insufficient_documents():
             "judge.tasks.lab5.load_dataset",
             return_value=Dataset.from_dict({"text": ["short"]}),
         ),
-        pytest.raises(ValueError, match="requires at least 50000 documents"),
+        pytest.raises(ValueError, match="requires exactly 50000 documents"),
     ):
         Lab5().load_dataset()
 
@@ -49,9 +43,8 @@ def test_lab5_is_registered_and_requires_gpu():
     assert task.metric_direction.value == "minimize"
     assert isinstance(task.evaluator, PerplexityEvaluator)
     assert task.evaluator.tokenizer_id == "meta-llama/Llama-3.2-1B"
-    assert task.evaluator.batch_size == 512
+    assert task.evaluator.max_seq_length == 8192
     assert task.evaluator.dtype == "bfloat16"
-    assert task.evaluator.max_length == 8192
 
 
 def test_lab5_loads_its_own_submission_and_uses_shared_evaluator(tmp_path):

@@ -1,173 +1,96 @@
-import copy
 import math
 import sys
-from dataclasses import dataclass, fields
-from itertools import chain
+import time
+from collections import deque
+from dataclasses import dataclass
+from itertools import pairwise
 from math import ceil
+from typing import cast
 
 import numpy as np
 import torch
-import torch._dynamo.config
 import torch.nn.functional as F
 from datasets import Dataset
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from judge.evaluators.base import Evaluator
 from judge.models import JudgeResult, TestResult
 
 CUDA_DEVICE = torch.device("cuda:0")
+CE_CHUNK_SIZE = 2048
+ROLLING_DOCUMENTS = 1000
+PROGRESS_INTERVAL_SECONDS = 30
 
 
-class CompilationRequiredModel(torch.nn.Module):
-    """Reject an eager forward even if compilation was disabled externally."""
-
-    def __init__(self, model: torch.nn.Module) -> None:
-        super().__init__()
-        self.model = model
-
-    def forward(self, **inputs):
-        if not torch.compiler.is_compiling():
-            raise RuntimeError("Perplexity model forward requires torch.compile")
-        return self.model(**inputs)
-
-
-class DecoderReplay(torch.nn.Module):
-    """Supply computed decoder states to the causal LM's own output-head code."""
-
-    def __init__(self, output_type, hidden_state_field):
-        super().__init__()
-        self.output_type = output_type
-        self.hidden_state_field = hidden_state_field
-
-    def forward(self, *args, inputs_embeds=None, **kwargs):
-        if inputs_embeds is None:
-            raise RuntimeError("Chunked output-head scoring requires decoder states")
-        return self.output_type(**{self.hidden_state_field: inputs_embeds})
-
-
-class OutputHeadLoss(torch.nn.Module):
-    """Keep the model's head, bias, projection, scaling, and softcapping intact."""
-
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, hidden_states, labels):
-        if not torch.compiler.is_compiling():
-            raise RuntimeError("Perplexity loss requires torch.compile")
-        logits = self.model(
-            inputs_embeds=hidden_states.unsqueeze(0),
-            use_cache=False,
-            return_dict=True,
-        ).logits
-        return F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]).float(),
-            labels,
-            reduction="none",
-        )
-
-
-def score_hidden_states(hidden_states, input_ids, attention_mask, loss_fn, chunk_size):
-    """Bound vocabulary-logit memory independently of the decoder batch size."""
-    labels = torch.full_like(input_ids, -100)
-    labels[:, :-1] = input_ids[:, 1:].masked_fill(~attention_mask[:, 1:].bool(), -100)
-    flat_labels = labels.reshape(-1)
-    hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-    losses = torch.empty(
-        flat_labels.shape, dtype=torch.float32, device=input_ids.device
-    )
-    for start in range(0, flat_labels.numel(), chunk_size):
-        stop = start + chunk_size
-        losses[start:stop] = loss_fn(hidden_states[start:stop], flat_labels[start:stop])
-    return document_scores(
-        losses.view_as(input_ids).sum(dim=1).tolist(),
-        attention_mask[:, 1:].sum(dim=1).tolist(),
-    )
-
-
-def scoring_decoder(model):
-    getter = getattr(model, "get_decoder", None)
-    decoder = getter() if callable(getter) else model.base_model
-    return model.base_model if decoder is model else decoder
-
-
-def supports_chunked_scoring(model):
-    """Use standard Transformers interfaces, without an architecture allowlist."""
-    if not isinstance(model, PreTrainedModel):
-        return False
-    decoder = scoring_decoder(model)
-    return (
-        decoder is not model
-        and any(child is decoder for child in model.modules())
-        and isinstance(model.get_output_embeddings(), torch.nn.Module)
-    )
-
-
-def replay_decoder(module, decoder, replay):
-    """Copy only decoder ancestors; keep original modules and weights untouched."""
-    if module is decoder:
-        return replay
-    children = {
-        name: replay_decoder(child, decoder, replay) if child is not None else None
-        for name, child in module._modules.items()
+def document_scores(loss_sums, token_counts):
+    ppls = [
+        safe_exp(loss / count) if count else None
+        for loss, count in zip(loss_sums, token_counts, strict=True)
+    ]
+    return {
+        "loss_sum": loss_sums,
+        "token_count": token_counts,
+        "document_perplexity": ppls,
     }
-    if all(child is module._modules[name] for name, child in children.items()):
-        return module
-    clone = copy.copy(module)
-    clone._modules = children
-    return clone
 
 
-class ChunkedPerplexityModel:
-    """Compile the standard base model and replay its output through the LM head."""
+def safe_exp(value: float) -> float:
+    return math.exp(value) if value < math.log(sys.float_info.max) else math.inf
 
-    def __init__(self, model: PreTrainedModel, chunk_size):
-        if not supports_chunked_scoring(model):
-            raise ValueError(
-                "Chunked scoring requires a separate base model and output head"
+
+@torch.inference_mode()
+def eval_batch_ppl(model, token_ids: list[list[int]]) -> dict[str, list]:
+    """Pack whole documents with isolated attention and next-token targets."""
+    lengths = [len(ids) for ids in token_ids]
+    if not lengths or any(length < 2 for length in lengths):
+        raise ValueError("Perplexity requires at least two tokens per document")
+    cu_lens = [0, *np.cumsum(lengths).tolist()]
+    cu_seqlens = torch.tensor(cu_lens, dtype=torch.int32, device=CUDA_DEVICE)
+    input_ids = torch.tensor(
+        [token for ids in token_ids for token in ids], device=CUDA_DEVICE
+    ).unsqueeze(0)
+    position_ids = torch.cat(
+        [torch.arange(length, device=CUDA_DEVICE) for length in lengths]
+    ).unsqueeze(0)
+    logits = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        cu_seq_lens_q=cu_seqlens,
+        cu_seq_lens_k=cu_seqlens,
+        max_length_q=max(lengths),
+        max_length_k=max(lengths),
+        use_cache=False,
+        return_dict=True,
+    ).logits
+    labels = input_ids.clone()
+    # Ignore predictions across document boundaries; retain real EOS tokens.
+    labels[:, cu_lens[:-1]] = -100
+    flattened_ce = torch.cat(
+        [
+            F.cross_entropy(
+                logits_chunk.float(),
+                labels_chunk,
+                ignore_index=-100,
+                reduction="none",
             )
-        self.model = model
-        self.decoder = torch.compile(
-            CompilationRequiredModel(scoring_decoder(model)),
-            backend="inductor",
-            fullgraph=True,
-            dynamic=True,
-        )
-        self.loss_fn = None
-        self.chunk_size = chunk_size
-
-    def score(self, inputs):
-        outputs = self.decoder(**inputs, use_cache=False, return_dict=True)
-        hidden_states = outputs[0]
-        if hidden_states.device != CUDA_DEVICE:
-            raise RuntimeError("Perplexity model returned hidden states outside cuda:0")
-        if self.loss_fn is None:
-            # Replay the actual decoder, including models exposing it below
-            # base_model (via get_decoder). Preserve the complete LM head forward.
-            head_model = replay_decoder(
-                self.model,
-                scoring_decoder(self.model),
-                DecoderReplay(type(outputs), fields(outputs)[0].name),
+            for logits_chunk, labels_chunk in zip(
+                logits[:, :-1, :].reshape(-1, logits.shape[-1]).split(CE_CHUNK_SIZE),
+                labels[:, 1:].reshape(-1).split(CE_CHUNK_SIZE),
+                strict=True,
             )
-            self.loss_fn = torch.compile(
-                OutputHeadLoss(head_model),
-                backend="inductor",
-                fullgraph=True,
-                dynamic=True,
-            )
-        return score_hidden_states(
-            hidden_states,
-            inputs["input_ids"],
-            inputs["attention_mask"],
-            self.loss_fn,
-            self.chunk_size,
-        )
+        ]
+    )
+    # Transfer all document losses together, avoiding a GPU sync per document.
+    loss_sums = torch.stack(
+        [flattened_ce[start : end - 1].sum() for start, end in pairwise(cu_lens)]
+    ).tolist()
+    return document_scores(loss_sums, [length - 1 for length in lengths])
 
 
 @torch.inference_mode()
 def evaluate_perplexity(
-    batch: dict[str, list | torch.Tensor], model, tokenizer, *, max_length: int = 1024
+    batch: dict[str, list | torch.Tensor], model, tokenizer
 ) -> dict[str, list]:
     inputs = (
         tokenizer(
@@ -175,54 +98,31 @@ def evaluate_perplexity(
             return_tensors="pt",
             padding="longest",
             truncation=True,
-            max_length=max_length,
         )
         if "text" in batch
         else {k: torch.as_tensor(v) for k, v in batch.items()}
     )
     inputs = {k: v.to(CUDA_DEVICE) for k, v in inputs.items()}
-    if isinstance(model, ChunkedPerplexityModel):
-        return model.score(inputs)
-    output = model(**inputs, use_cache=False)
-    if output.logits.device != CUDA_DEVICE:
-        raise RuntimeError("Perplexity model returned logits outside cuda:0")
-    return score_logits(output.logits, inputs["input_ids"], inputs["attention_mask"])
+    output = model(**inputs, return_dict=True, use_cache=False)
+    logits = output.logits
 
+    labels = inputs["input_ids"]
+    # Attention masks distinguish real EOS tokens from padding when IDs coincide.
+    mask = inputs.get("attention_mask", labels != tokenizer.pad_token_id).bool()
+    valid = mask[:, :-1] & mask[:, 1:] & (labels[:, 1:] != -100)
+    truncated_labels = labels[:, 1:].masked_fill(~valid, -100)
+    truncated_logits = logits[:, :-1, :]
 
-def score_logits(
-    logits: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor
-) -> dict[str, list]:
-    """Compute padding-aware document losses from next-token logits."""
-    logits = logits[:, :-1, :].float().contiguous()
-    labels = input_ids[:, 1:].contiguous()
-    mask = attention_mask[:, 1:].bool()
-
-    losses = F.cross_entropy(
-        logits.view(-1, logits.shape[-1]), labels.view(-1), reduction="none"
+    flattened_ce = F.cross_entropy(
+        truncated_logits.reshape(-1, truncated_logits.shape[-1]).float(),
+        truncated_labels.reshape(-1),
+        ignore_index=-100,
+        reduction="none",
     )
-
-    losses = losses.view_as(labels).masked_fill(~mask, 0)
-    loss_sums = losses.sum(dim=1).tolist()
-    token_counts = mask.sum(dim=1).tolist()
+    ce = flattened_ce.reshape_as(truncated_labels)
+    loss_sums = ce.sum(dim=-1).tolist()
+    token_counts = valid.sum(dim=-1).tolist()
     return document_scores(loss_sums, token_counts)
-
-
-def document_scores(loss_sums, token_counts):
-    document_perplexities = [
-        (
-            math.exp(loss_sum / token_count)
-            if loss_sum / token_count < math.log(sys.float_info.max)
-            else math.inf
-        )
-        if token_count
-        else None
-        for loss_sum, token_count in zip(loss_sums, token_counts, strict=True)
-    ]
-    return {
-        "loss_sum": loss_sums,
-        "token_count": token_counts,
-        "document_perplexity": document_perplexities,
-    }
 
 
 @dataclass(frozen=True)
@@ -231,9 +131,10 @@ class PerplexityEvaluator(Evaluator):
 
     batch_size: int = 32
     tokenizer_id: str | None = None
-    max_length: int = 1024
     dtype: str = "auto"
-    logits_chunk_size: int = 4096
+    # None retains padded evaluation for architectures such as GPT-2.
+    # Otherwise this is both the document truncation and packed token budget.
+    max_seq_length: int | None = None
 
     def validate_runtime(self) -> None:
         if not torch.cuda.is_available():
@@ -242,65 +143,13 @@ class PerplexityEvaluator(Evaluator):
             )
         if self.batch_size < 1:
             raise ValueError("Perplexity batch_size must be positive")
-        if self.max_length < 2:
-            raise ValueError("Perplexity max_length must be at least two tokens")
-        if self.logits_chunk_size < 1:
-            raise ValueError("Perplexity logits_chunk_size must be positive")
         if self.dtype not in {"auto", "float32", "float16", "bfloat16"}:
             raise ValueError("Unsupported perplexity dtype")
+        if self.max_seq_length is not None and self.max_seq_length < 2:
+            raise ValueError("Perplexity max_seq_length must be at least two")
 
-    @torch.inference_mode()
-    def evaluate(self, model_id: str, dataset: Dataset) -> JudgeResult:
-        self.validate_runtime()
-        print(f"[perplexity] loading model {model_id} on {CUDA_DEVICE}", flush=True)
-        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=self.dtype)
-        max_length = self.max_length
-        context_length = getattr(model.config, "max_position_embeddings", None)
-        if isinstance(context_length, int) and context_length > 0:
-            max_length = min(max_length, context_length)
-        torch.nn.Module.to(model, device=CUDA_DEVICE)
-        model.eval()
-        if any(
-            tensor.device != CUDA_DEVICE
-            for tensor in chain(model.parameters(), model.buffers())
-        ):
-            raise RuntimeError(
-                "All perplexity model parameters and buffers must be on cuda:0"
-            )
-        print(
-            "[perplexity] torch.compile enabled (inductor, fullgraph, dynamic)",
-            flush=True,
-        )
-        if supports_chunked_scoring(model):
-            print(
-                f"[perplexity] chunked output-head loss ({self.logits_chunk_size} tokens/chunk)",
-                flush=True,
-            )
-            model = ChunkedPerplexityModel(model, self.logits_chunk_size)
-        else:
-            model = torch.compile(
-                CompilationRequiredModel(model),
-                backend="inductor",
-                fullgraph=True,
-                dynamic=True,
-            )
-        tokenizer_id = self.tokenizer_id or model_id
-        print(f"[perplexity] loading tokenizer {tokenizer_id}", flush=True)
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
-        if tokenizer.pad_token is None:
-            if tokenizer.eos_token is None:
-                raise ValueError(
-                    "Perplexity tokenizer requires a pad token or EOS token"
-                )
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "right"
-
-        total_loss = 0.0
-        total_tokens = 0
-        document_perplexities = []
-        with torch._dynamo.config.patch(
-            suppress_errors=False, fail_on_recompile_limit_hit=True
-        ):
+    def evaluation_batches(self, model, tokenizer, dataset):
+        if self.max_seq_length is None:
             for batch in tqdm(
                 dataset.iter(batch_size=self.batch_size),
                 desc="[perplexity] evaluating batches",
@@ -308,16 +157,104 @@ class PerplexityEvaluator(Evaluator):
                 file=sys.stdout,
                 mininterval=5,
             ):
-                results = evaluate_perplexity(
-                    batch, model, tokenizer, max_length=max_length
+                yield evaluate_perplexity(batch, model, tokenizer)
+            return
+        tokenized = dataset.map(
+            lambda batch: tokenizer(
+                batch["text"],
+                padding=False,
+                truncation=True,
+                max_length=self.max_seq_length,
+            ),
+            batched=True,
+            remove_columns=dataset.column_names,
+            desc="[perplexity] tokenizing",
+        )
+        pack = []
+        pack_length = 0
+        for batch in tokenized.iter(batch_size=1000):
+            for token_ids in batch["input_ids"]:
+                if len(token_ids) < 2:
+                    continue
+                if pack and pack_length + len(token_ids) > self.max_seq_length:
+                    yield eval_batch_ppl(model, pack)
+                    pack = []
+                    pack_length = 0
+                pack.append(token_ids)
+                pack_length += len(token_ids)
+        if pack:
+            yield eval_batch_ppl(model, pack)
+
+    @torch.inference_mode()
+    def evaluate(self, model_id: str, dataset: Dataset) -> JudgeResult:
+        self.validate_runtime()
+        print(f"[perplexity] loading model {model_id} on {CUDA_DEVICE}", flush=True)
+        model_options = {"dtype": self.dtype}
+        if self.max_seq_length is not None:
+            # Select the prebuilt Hub kernel explicitly. The automatic FA2
+            # fallback can replace a kernel-loading error with a misleading
+            # missing-flash_attn ImportError.
+            model_options["attn_implementation"] = "kernels-community/flash-attn2"
+        model = cast(
+            torch.nn.Module,
+            AutoModelForCausalLM.from_pretrained(model_id, **model_options),
+        )
+        model = model.to(CUDA_DEVICE).eval()
+        model = torch.compile(model, dynamic=True, fullgraph=True)
+        print(
+            "[perplexity] torch.compile enabled (inductor, fullgraph, dynamic)",
+            flush=True,
+        )
+        tokenizer_id = self.tokenizer_id or model_id
+        print(f"[perplexity] loading tokenizer {tokenizer_id}", flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+        if tokenizer is None:
+            raise ValueError("Perplexity tokenizer could not be loaded")
+        if self.max_seq_length is None and tokenizer.pad_token_id is None:
+            if tokenizer.eos_token_id is None:
+                raise ValueError(
+                    "Perplexity tokenizer requires a pad token or EOS token"
                 )
-                total_loss += sum(results["loss_sum"])
-                total_tokens += sum(results["token_count"])
-                document_perplexities.extend(
-                    value
-                    for value in results["document_perplexity"]
-                    if value is not None
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        total_loss = 0.0
+        total_tokens = 0
+        document_perplexities = []
+        recent = deque(maxlen=ROLLING_DOCUMENTS)
+        last_log = time.monotonic()
+
+        def log_progress():
+            if not total_tokens:
+                return
+            rolling_loss = sum(loss for loss, _ in recent)
+            rolling_tokens = sum(count for _, count in recent)
+            print(
+                f"[perplexity] scored {len(document_perplexities)}/{len(dataset)} documents; "
+                f"tokens={total_tokens}; "
+                f"running_corpus_perplexity={safe_exp(total_loss / total_tokens):.4f}; "
+                f"rolling_corpus_perplexity={safe_exp(rolling_loss / rolling_tokens):.4f} "
+                f"(last {len(recent)} scored documents)",
+                flush=True,
+            )
+
+        for results in self.evaluation_batches(model, tokenizer, dataset):
+            total_loss += sum(results["loss_sum"])
+            total_tokens += sum(results["token_count"])
+            document_perplexities.extend(
+                value for value in results["document_perplexity"] if value is not None
+            )
+            recent.extend(
+                (loss, count)
+                for loss, count in zip(
+                    results["loss_sum"], results["token_count"], strict=True
                 )
+                if count
+            )
+            now = time.monotonic()
+            if now - last_log >= PROGRESS_INTERVAL_SECONDS:
+                log_progress()
+                last_log = now
+        log_progress()
         if total_tokens == 0:
             return JudgeResult(
                 passed=False,

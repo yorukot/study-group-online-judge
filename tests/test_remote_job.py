@@ -56,7 +56,8 @@ class RemoteJobTests(unittest.TestCase):
         }
 
     def setup_repository(self, command, **kwargs):
-        script = Path(command[-1]) / "src/labs/lab2.sbatch"
+        task_id = kwargs["env"]["JUDGE_TASK_ID"]
+        script = Path(command[-1]) / f"src/labs/{task_id}.sbatch"
         script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text("#!/bin/bash\n")
         kwargs["stdout"].write("repository ready\n")
@@ -83,6 +84,19 @@ class RemoteJobTests(unittest.TestCase):
             [result.slurm_job_id for result in results], ["12345", "12345"]
         )
         self.submit.assert_called_once()
+
+    def test_lab5_setup_receives_task_id_for_evaluator_dependencies(self):
+        self.request.submission.task_id = "lab5"
+        snapshot = handle(self.request)
+        self.assertEqual(snapshot.slurm_job_id, "12345")
+        self.assertEqual(
+            self.setup_process.call_args.kwargs["env"]["JUDGE_TASK_ID"], "lab5"
+        )
+        self.assertEqual(self.submit.call_args.kwargs["task_id"], "lab5")
+        self.assertEqual(
+            self.setup_process.call_args.kwargs["env"]["JUDGE_TRUSTED_ROOT"],
+            self.request.trusted_root,
+        )
 
     def test_rejects_changed_job_identity(self):
         handle(self.request)

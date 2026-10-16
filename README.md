@@ -90,21 +90,47 @@ The perplexity evaluator supports causal language models loadable by
 `tokenizer_id` to use a fixed tokenizer for a lab. Lab 4 uses
 `openai-community/gpt2`; Lab 5 evaluates Llama 3.2 models with the tokenizer
 from [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B)
-and batches of one document with an 8,192-token limit. The generic evaluator
-defaults to 1,024 tokens, configurable through `max_length` and capped by the
-model's declared context length. Existing tokenizer padding tokens are preserved;
-otherwise EOS is used for padding. Padding stays on the right and is excluded
-from scoring.
+and bfloat16 FlashAttention-2 with whole documents greedily packed into an
+8,192-token budget. Documents are tokenized once, truncated to 8,192 tokens,
+and use independent attention and reset position IDs. Cross-document next-token
+targets are excluded; real EOS tokens are scored. Float32 cross-entropy uses
+2,048-token chunks. The evaluator explicitly selects
+`attn_implementation="kernels-community/flash-attn2"`; it uses the prebuilt Hub
+kernel through `kernels` without requiring the `flash-attn` package. Lab 5
+submission setup resolves the trusted judge's complete runtime requirements
+from `pyproject.toml` into the participant's `.venv`, including for older commits.
+The install is constrained to the exact versions in the prepared trusted
+environment, preserving its resolved CUDA stack and excluding the judge project
+itself from the constraints. Participant-only packages remain installed.
+Transformers 5, Hub 1, PyTorch 2, and Datasets 4 are required. It runs `uv pip check`
+and imports the evaluator and kernel integration with that same interpreter
+before submitting to Slurm; installed versions are recorded in `setup.log`.
+Model compilation uses
+`dynamic=True, fullgraph=True`.
+
+After changing runtime dependencies, run `uv sync --frozen`, `uv pip check`,
+`python -m judge.check_runtime`, and the test suite locally. Validate the same
+full-runtime installation against an older participant environment; installing
+a single new package is insufficient to establish compatibility.
+Lab 4 retains padded batches and truncates to its tokenizer's maximum length.
+Existing tokenizer padding tokens and padding side are preserved; otherwise EOS
+is used for padding. Padding is excluded from both the loss and token count,
+including next-token pairs whose preceding position is padding.
+Evaluation logs show the cumulative corpus perplexity and a token-weighted rolling
+perplexity over the latest 1,000 scored documents every 30 seconds during scoring,
+and once at completion. Both use `exp(sum(loss) / sum(scored tokens))`.
 
 ### Lab 5 submission
 
 Shuffle the entire `train` split of `allenai/dolma3_mix-150B-1025` with seed 42
 and reserve the last **50,000 documents** before tokenization or packing. Exclude
 all of those documents from training. Participants may use at most **10,000**
-of them for periodic validation. The OJ evaluates all 50,000, truncating each
-document to its first 8,192 tokenizer tokens; it does not pack documents or use
-sliding windows. The corpus score weights each non-padding next-token target
-equally, with document p90/p99 reported separately.
+of them for periodic validation. The OJ loads the already shuffled and filtered
+`train` split of `cerulean-works/study-group-lab5-eval` directly, without shuffling
+or selecting another tail. It evaluates all 50,000, truncating and packing as
+described above. The corpus score weights each valid next-token target equally,
+with document p90/p99 reported separately. Documents with fewer than two tokens
+are counted as skipped.
 
 Train the Llama 3.2 1B architecture from randomly initialized weights with an
 8,192-token training context. Upload both weights and tokenizer to Hugging Face.

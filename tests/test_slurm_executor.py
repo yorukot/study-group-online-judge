@@ -47,6 +47,22 @@ class SlurmExecutorTests(unittest.TestCase):
         self.assertIn("--partition=8gpus", command)
         self.assertIn("--time=241", command)
 
+    def test_excludes_faulty_nodes_in_both_partitions(self) -> None:
+        for seconds in (3600, 14401):
+            command = self.command(Resources(gpus=1, timeout_seconds=seconds))
+            exclusions = [arg for arg in command if arg.startswith("--exclude=")]
+            self.assertEqual(len(exclusions), 1)
+            self.assertEqual(
+                set(exclusions[0].split("=", 1)[1].split(",")),
+                {
+                    "25a-hgpn001",
+                    "25a-hgpn003",
+                    "25a-hgpn027",
+                    "25a-hgpn062",
+                    "25a-hgpn145",
+                },
+            )
+
     def test_rejects_invalid_resources_and_missing_script(self) -> None:
         for resources in (
             Resources(gpus=0),

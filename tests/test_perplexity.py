@@ -1,5 +1,5 @@
 import math
-import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,313 +21,340 @@ from transformers import (
 
 from judge.evaluators import PerplexityEvaluator
 from judge.evaluators.perplexity import (
+    CE_CHUNK_SIZE,
     CUDA_DEVICE,
-    ChunkedPerplexityModel,
-    CompilationRequiredModel,
-    DecoderReplay,
-    OutputHeadLoss,
+    eval_batch_ppl,
     evaluate_perplexity,
-    score_hidden_states,
-    score_logits,
-    supports_chunked_scoring,
 )
 
 
-@pytest.fixture(autouse=True)
-def isolate_compiled_model_caches():
-    # Parametrized architectures/precisions must not exhaust a shared wrapper's
-    # Dynamo cache and trigger production recompilation limits in unrelated tests.
-    torch._dynamo.reset()
-    yield
-    torch._dynamo.reset()
-
-
 class TokenizerStub:
-    eos_token: str | None = "<eos>"
-
-    def __init__(self) -> None:
-        self.pad_token = None
-        self.padding_side = "left"
+    def __init__(self, pad_token_id=0, eos_token_id=2, padding_side="right"):
+        self.pad_token_id = pad_token_id
+        self.eos_token_id = eos_token_id
+        self.padding_side = padding_side
 
     def __call__(self, texts, **kwargs):
-        assert kwargs["padding"] == "longest"
-        sequences = {"short": [1, 2], "long": [1, 3, 2, 3], "tiny": [1]}
-        ids = [sequences[text] for text in texts]
-        width = max(map(len, ids))
-        return {
-            "input_ids": torch.tensor([row + [0] * (width - len(row)) for row in ids]),
-            "attention_mask": torch.tensor(
-                [[1] * len(row) + [0] * (width - len(row)) for row in ids]
-            ),
+        assert kwargs == {
+            "return_tensors": "pt",
+            "padding": "longest",
+            "truncation": True,
         }
+        sequences = {"short": [1, 2], "long": [1, 3, 2, 3], "tiny": [1]}
+        rows = [sequences[text] for text in texts]
+        width = max(map(len, rows))
+        ids, masks = [], []
+        for row in rows:
+            padding = [self.pad_token_id] * (width - len(row))
+            mask = [1] * len(row)
+            zeros = [0] * len(padding)
+            ids.append(row + padding if self.padding_side == "right" else padding + row)
+            masks.append(mask + zeros if self.padding_side == "right" else zeros + mask)
+        return {"input_ids": torch.tensor(ids), "attention_mask": torch.tensor(masks)}
 
 
-class PerplexityMathTests(unittest.TestCase):
-    def test_per_document_losses_ignore_padding_and_aggregate_by_token(self) -> None:
-        logits = torch.zeros((2, 4, 4))
-        logits[0, 0, 2] = 2
-        logits[0, 1:, 0] = 100  # Padded positions must not affect the score.
-        logits[1, 0, 3] = 1
-        logits[1, 1, 2] = 1
-        logits[1, 2, 3] = 1
+def reference_scores(logits, input_ids, attention_mask):
+    """Independent scalar next-token NLL oracle, without production CE/reductions."""
+    losses, counts, ppls = [], [], []
+    for row in range(len(input_ids)):
+        terms = []
+        for position in range(1, len(input_ids[row])):
+            target = int(input_ids[row, position])
+            if (
+                attention_mask[row, position - 1]
+                and attention_mask[row, position]
+                and target != -100
+            ):
+                scores = logits[row, position - 1].double()
+                terms.append((torch.logsumexp(scores, dim=0) - scores[target]).item())
+        losses.append(sum(terms))
+        counts.append(len(terms))
+        ppls.append(math.exp(sum(terms) / len(terms)) if terms else None)
+    return {"loss_sum": losses, "token_count": counts, "document_perplexity": ppls}
 
-        inputs = TokenizerStub()(["short", "long"], padding="longest")
-        result = score_logits(logits, **inputs)
-        first_loss = F.cross_entropy(logits[0, 0], torch.tensor(2)).item()
-        second_loss = sum(
-            F.cross_entropy(logits[1, index], torch.tensor(label)).item()
-            for index, label in enumerate([3, 2, 3])
+
+def assert_scores(actual, expected, rel=1e-6):
+    assert actual["token_count"] == expected["token_count"]
+    assert actual["loss_sum"] == pytest.approx(expected["loss_sum"], rel=rel, abs=1e-6)
+    for actual_ppl, expected_ppl in zip(
+        actual["document_perplexity"], expected["document_perplexity"], strict=True
+    ):
+        if expected_ppl is None:
+            assert actual_ppl is None
+        else:
+            assert actual_ppl == pytest.approx(expected_ppl, rel=rel)
+
+
+@pytest.mark.parametrize("padding_side", ["left", "right"])
+@pytest.mark.parametrize("pad_token_id", [0, 2])
+@pytest.mark.parametrize("pretokenized", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_batch_matches_reference_with_padding_eos_and_causal_shift(
+    padding_side, pad_token_id, pretokenized, dtype
+):
+    tokenizer = TokenizerStub(pad_token_id=pad_token_id, padding_side=padding_side)
+    texts = ["short", "long", "tiny"]
+    inputs = tokenizer(texts, return_tensors="pt", padding="longest", truncation=True)
+    torch.manual_seed(42)
+    logits = torch.randn(3, 4, 4).to(dtype)
+    # Even very bad predictions at padding must not affect loss or denominator.
+    logits[~inputs["attention_mask"].bool(), :] = 100
+    model = MagicMock(return_value=SimpleNamespace(logits=logits))
+    batch = (
+        {k: v.tolist() for k, v in inputs.items()} if pretokenized else {"text": texts}
+    )
+    with patch("judge.evaluators.perplexity.CUDA_DEVICE", torch.device("cpu")):
+        actual = evaluate_perplexity(batch, model, tokenizer)
+    assert_scores(actual, reference_scores(logits, **inputs))
+    assert actual["token_count"] == [1, 3, 0]
+    model.assert_called_once()
+    assert model.call_args.kwargs["return_dict"] is True
+    assert model.call_args.kwargs["use_cache"] is False
+    for key, tensor in inputs.items():
+        torch.testing.assert_close(model.call_args.kwargs[key], tensor)
+
+
+@pytest.mark.parametrize("ids, mask", [([[1]], [[1]]), ([[0, 0]], [[0, 0]])])
+def test_documents_without_next_token_targets_are_skipped(ids, mask):
+    inputs = {"input_ids": ids, "attention_mask": mask}
+    model = MagicMock(
+        return_value=SimpleNamespace(logits=torch.zeros(1, len(ids[0]), 4))
+    )
+    with patch("judge.evaluators.perplexity.CUDA_DEVICE", torch.device("cpu")):
+        result = evaluate_perplexity(inputs, model, TokenizerStub())
+    assert result == {
+        "loss_sum": [0],
+        "token_count": [0],
+        "document_perplexity": [None],
+    }
+
+
+def test_pretokenized_inputs_without_mask_use_pad_id():
+    ids = torch.tensor([[1, 2, 0, 0], [0, 1, 3, 2]])
+    logits = torch.randn(2, 4, 4)
+    model = MagicMock(return_value=SimpleNamespace(logits=logits))
+    tokenizer = MagicMock(pad_token_id=0)
+    with patch("judge.evaluators.perplexity.CUDA_DEVICE", torch.device("cpu")):
+        actual = evaluate_perplexity({"input_ids": ids}, model, tokenizer)
+    tokenizer.assert_not_called()
+    assert_scores(actual, reference_scores(logits, ids, ids != 0))
+
+
+@pytest.mark.parametrize("loss", [100.0, 1000.0])
+def test_document_exponentiation_uses_python_float_and_handles_overflow(loss):
+    logits = torch.tensor([[[0.0, -loss], [0.0, 0.0]]])
+    model = MagicMock(return_value=SimpleNamespace(logits=logits))
+    with patch("judge.evaluators.perplexity.CUDA_DEVICE", torch.device("cpu")):
+        actual = evaluate_perplexity({"input_ids": [[0, 1]]}, model, TokenizerStub(2))
+    expected = math.exp(loss) if loss == 100 else math.inf
+    assert actual["document_perplexity"] == [expected]
+
+
+@contextmanager
+def evaluator_runtime(tokenizer=None, compiled=None, compile_error=None):
+    model = MagicMock()
+    model.to.return_value = model
+    model.eval.return_value = model
+    tokenizer = tokenizer or TokenizerStub(pad_token_id=None)
+    compiled = compiled if compiled is not None else MagicMock()
+    with (
+        patch("judge.evaluators.perplexity.torch.cuda.is_available", return_value=True),
+        patch(
+            "judge.evaluators.perplexity.AutoModelForCausalLM.from_pretrained",
+            return_value=model,
+        ) as load_model,
+        patch(
+            "judge.evaluators.perplexity.AutoTokenizer.from_pretrained",
+            return_value=tokenizer,
+        ) as load_tokenizer,
+        patch(
+            "judge.evaluators.perplexity.torch.compile",
+            return_value=compiled,
+            side_effect=compile_error,
+        ) as compile_model,
+    ):
+        yield SimpleNamespace(
+            model=model,
+            tokenizer=tokenizer,
+            compiled=compiled,
+            load_model=load_model,
+            load_tokenizer=load_tokenizer,
+            compile=compile_model,
         )
 
-        self.assertEqual(result["token_count"], [1, 3])
-        self.assertAlmostEqual(result["loss_sum"][0], first_loss, places=5)
-        self.assertAlmostEqual(result["loss_sum"][1], second_loss, places=5)
-        self.assertAlmostEqual(
-            result["document_perplexity"][0], math.exp(first_loss), places=5
+
+def test_requires_cuda_before_loading_model():
+    with (
+        patch(
+            "judge.evaluators.perplexity.torch.cuda.is_available", return_value=False
+        ),
+        patch(
+            "judge.evaluators.perplexity.AutoModelForCausalLM.from_pretrained"
+        ) as load,
+        pytest.raises(RuntimeError, match="requires a CUDA GPU"),
+    ):
+        PerplexityEvaluator().evaluate("model", Dataset.from_dict({"text": ["short"]}))
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"batch_size": 0},
+        {"batch_size": -1},
+        {"dtype": "int8"},
+        {"max_seq_length": 0},
+        {"max_seq_length": 1},
+    ],
+)
+def test_invalid_evaluator_settings(kwargs):
+    with (
+        patch("judge.evaluators.perplexity.torch.cuda.is_available", return_value=True),
+        pytest.raises(ValueError),
+    ):
+        PerplexityEvaluator(**kwargs).validate_runtime()
+
+
+def test_runtime_compiles_direct_model_and_aggregates_by_token():
+    dataset = Dataset.from_dict({"text": ["short", "long", "tiny"]})
+    batches = [
+        {
+            "loss_sum": [0, 2],
+            "token_count": [1, 3],
+            "document_perplexity": [1, math.exp(2 / 3)],
+        },
+        {"loss_sum": [3], "token_count": [1], "document_perplexity": [math.exp(3)]},
+    ]
+    with (
+        evaluator_runtime() as runtime,
+        patch(
+            "judge.evaluators.perplexity.evaluate_perplexity", side_effect=batches
+        ) as score,
+    ):
+        result = PerplexityEvaluator(
+            batch_size=2, tokenizer_id="fixed/tokenizer", dtype="bfloat16"
+        ).evaluate("student/model", dataset)
+    assert result.passed
+    assert result.score == pytest.approx(math.e)
+    assert result.metrics["corpus_perplexity"] == result.score
+    assert result.metrics["evaluated_tokens"] == 5
+    assert result.metrics["evaluated_documents"] == 3
+    assert result.metrics["skipped_documents"] == 0
+    for percentile in (90, 99):
+        assert result.metrics[f"p{percentile}_document_perplexity"] == pytest.approx(
+            np.percentile([1, math.exp(2 / 3), math.exp(3)], percentile)
         )
-        self.assertAlmostEqual(
-            result["document_perplexity"][1], math.exp(second_loss / 3), places=5
+    runtime.load_model.assert_called_once_with("student/model", dtype="bfloat16")
+    runtime.load_tokenizer.assert_called_once_with("fixed/tokenizer")
+    runtime.model.to.assert_called_once_with(CUDA_DEVICE)
+    runtime.model.eval.assert_called_once_with()
+    runtime.compile.assert_called_once_with(runtime.model, dynamic=True, fullgraph=True)
+    assert runtime.tokenizer.pad_token_id == runtime.tokenizer.eos_token_id
+    assert score.call_count == 2
+    assert score.call_args_list[0].args[0] == {"text": ["short", "long"]}
+    assert score.call_args_list[1].args[0] == {"text": ["tiny"]}
+    assert score.call_args.args[1] is runtime.compiled
+    assert score.call_args.kwargs == {}
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 3])
+@pytest.mark.parametrize("padding_side", ["left", "right"])
+def test_end_to_end_score_is_invariant_to_batch_size_and_padding(
+    batch_size, padding_side
+):
+    # Uniform four-class logits give NLL log(4), independent of batching/padding.
+    model = MagicMock(
+        side_effect=lambda **inputs: SimpleNamespace(
+            logits=torch.zeros(*inputs["input_ids"].shape, 4)
         )
-        self.assertNotEqual(*result["document_perplexity"])
+    )
+    tokenizer = TokenizerStub(pad_token_id=2, padding_side=padding_side)
+    with (
+        evaluator_runtime(tokenizer, compiled=model) as runtime,
+        patch("judge.evaluators.perplexity.CUDA_DEVICE", torch.device("cpu")),
+    ):
+        result = PerplexityEvaluator(batch_size=batch_size).evaluate(
+            "student/model", Dataset.from_dict({"text": ["short", "long", "tiny"]})
+        )
+    assert result.passed
+    assert result.score == pytest.approx(4)
+    assert result.metrics["evaluated_tokens"] == 4
+    assert result.metrics["evaluated_documents"] == 2
+    assert result.metrics["skipped_documents"] == 1
+    assert result.metrics["p90_document_perplexity"] == pytest.approx(4)
+    assert result.metrics["p99_document_perplexity"] == pytest.approx(4)
+    runtime.load_tokenizer.assert_called_once_with("student/model")
+    assert tokenizer.pad_token_id == 2
+    assert tokenizer.padding_side == padding_side
 
-    def test_short_document_has_no_scored_tokens(self) -> None:
-        inputs = TokenizerStub()(["tiny"], padding="longest")
-        result = score_logits(torch.zeros((1, 1, 4)), **inputs)
-        self.assertEqual(result["token_count"], [0])
-        self.assertEqual(result["loss_sum"], [0])
-        self.assertEqual(result["document_perplexity"], [None])
+
+@pytest.mark.parametrize("texts", [[], ["tiny"]])
+def test_empty_validation_tokens_fail_cleanly(texts):
+    with (
+        evaluator_runtime(
+            compiled=MagicMock(
+                return_value=SimpleNamespace(logits=torch.zeros(1, 1, 4))
+            )
+        ),
+        patch("judge.evaluators.perplexity.CUDA_DEVICE", torch.device("cpu")),
+    ):
+        result = PerplexityEvaluator().evaluate(
+            "student/model", Dataset.from_dict({"text": texts})
+        )
+    assert not result.passed
+    assert result.tests[0].name == "validation_data"
 
 
-class PerplexityRuntimeTests(unittest.TestCase):
-    def setUp(self):
-        self.dataset = Dataset.from_dict({"text": ["short", "long", "tiny"]})
-        self.model = MagicMock()
-        self.model.parameters.return_value = [SimpleNamespace(device=CUDA_DEVICE)]
-        self.model.buffers.return_value = [SimpleNamespace(device=CUDA_DEVICE)]
-        self.tokenizer = TokenizerStub()
-
-    def evaluate_with(self, results, evaluator=None, **compile_kwargs):
-        with (
-            patch(
-                "judge.evaluators.perplexity.torch.cuda.is_available", return_value=True
-            ),
-            patch(
-                "judge.evaluators.perplexity.AutoModelForCausalLM.from_pretrained",
-                return_value=self.model,
-            ) as load_model,
-            patch(
-                "judge.evaluators.perplexity.AutoTokenizer.from_pretrained",
-                return_value=self.tokenizer,
-            ) as load_tokenizer,
-            patch("judge.evaluators.perplexity.torch.nn.Module.to") as move,
-            patch(
-                "judge.evaluators.perplexity.torch.compile", **compile_kwargs
-            ) as compile_model,
-            patch(
-                "judge.evaluators.perplexity.evaluate_perplexity", side_effect=results
-            ) as batch,
-        ):
-            self.load_tokenizer = load_tokenizer
-            evaluator = evaluator or PerplexityEvaluator(batch_size=2)
-            result = evaluator.evaluate("cerulean/trained-gpt2", self.dataset)
-        return result, load_model, move, compile_model, batch
-
-    def test_requires_cuda_before_loading_model(self):
-        with (
-            patch(
-                "judge.evaluators.perplexity.torch.cuda.is_available",
-                return_value=False,
-            ),
-            patch(
-                "judge.evaluators.perplexity.AutoModelForCausalLM.from_pretrained"
-            ) as load,
-            self.assertRaisesRegex(RuntimeError, "requires a CUDA GPU"),
-        ):
-            PerplexityEvaluator().evaluate("model", self.dataset)
-        load.assert_not_called()
-
-    def test_requires_positive_batch_size(self):
-        with (
-            patch(
-                "judge.evaluators.perplexity.torch.cuda.is_available", return_value=True
-            ),
-            self.assertRaisesRegex(ValueError, "batch_size"),
-        ):
-            PerplexityEvaluator(batch_size=0).validate_runtime()
-
-    def test_evaluates_compiled_model_and_preserves_corpus_metrics(self):
-        batch_results = [
-            {
-                "loss_sum": [0.0, 2.0],
-                "token_count": [1, 3],
-                "document_perplexity": [1.0, math.exp(2 / 3)],
-            },
-            {
-                "loss_sum": [3.0],
+@pytest.mark.parametrize("value", [math.inf, math.nan, 1000.0])
+def test_nonfinite_perplexity_fails(value):
+    with (
+        evaluator_runtime(),
+        patch(
+            "judge.evaluators.perplexity.evaluate_perplexity",
+            return_value={
+                "loss_sum": [value],
                 "token_count": [1],
-                "document_perplexity": [math.exp(3)],
+                "document_perplexity": [value],
             },
-        ]
-
-        # Assert strict configuration from inside the lazy forward calls.
-        def score_batch(*args, **kwargs):
-            self.assertFalse(torch._dynamo.config.suppress_errors)
-            self.assertTrue(torch._dynamo.config.fail_on_recompile_limit_hit)
-            return batch_results.pop(0)
-
-        compiled = MagicMock()
-        result, load, move, compile_model, batch = self.evaluate_with(
-            score_batch, return_value=compiled
+        ),
+    ):
+        result = PerplexityEvaluator().evaluate(
+            "student/model", Dataset.from_dict({"text": ["short"]})
         )
-        self.assertTrue(result.passed)
-        self.assertAlmostEqual(result.score, math.e)
-        self.assertEqual(result.metrics["evaluated_tokens"], 5)
-        self.assertEqual(result.metrics["evaluated_documents"], 3)
-        self.assertAlmostEqual(
-            result.metrics["p90_document_perplexity"],
-            float(np.percentile([1, math.exp(2 / 3), math.exp(3)], 90)),
-        )
-        load.assert_called_once_with("cerulean/trained-gpt2", dtype="auto")
-        self.load_tokenizer.assert_called_once_with("cerulean/trained-gpt2")
-        move.assert_called_once_with(self.model, device=CUDA_DEVICE)
-        compile_model.assert_called_once()
-        assert isinstance(compile_model.call_args.args[0], CompilationRequiredModel)
-        self.assertIs(compile_model.call_args.args[0].model, self.model)
-        self.assertEqual(
-            compile_model.call_args.kwargs,
-            {"backend": "inductor", "fullgraph": True, "dynamic": True},
-        )
-        self.assertEqual(batch.call_count, 2)
-        self.assertIs(batch.call_args.args[1], compiled)
-        self.assertEqual(batch.call_args.kwargs, {"max_length": 1024})
-        self.model.eval.assert_called_once_with()
-        self.assertEqual(self.tokenizer.pad_token, self.tokenizer.eos_token)
-        self.assertEqual(self.tokenizer.padding_side, "right")
+    assert not result.passed
+    assert result.tests[0].name == "perplexity"
 
-    def test_fixed_tokenizer_and_custom_length_are_used(self):
-        _, _, _, _, batch = self.evaluate_with(
-            [{"loss_sum": [1], "token_count": [1], "document_perplexity": [math.e]}],
-            evaluator=PerplexityEvaluator(
-                tokenizer_id="meta-llama/Llama-3.2-1B", max_length=2048
-            ),
-        )
-        self.load_tokenizer.assert_called_once_with("meta-llama/Llama-3.2-1B")
-        self.assertEqual(batch.call_args.kwargs, {"max_length": 2048})
 
-    def test_length_is_capped_by_model_context(self):
-        self.model.config.max_position_embeddings = 64
-        _, _, _, _, batch = self.evaluate_with(
-            [
-                {"loss_sum": [1], "token_count": [1], "document_perplexity": [math.e]},
-                {"loss_sum": [1], "token_count": [1], "document_perplexity": [math.e]},
-            ]
-        )
-        self.assertEqual(batch.call_args.kwargs, {"max_length": 64})
+def test_missing_pad_and_eos_tokens_fail():
+    with (
+        evaluator_runtime(TokenizerStub(pad_token_id=None, eos_token_id=None)),
+        pytest.raises(ValueError, match="pad token or EOS token"),
+    ):
+        PerplexityEvaluator().evaluate("model", Dataset.from_dict({"text": ["short"]}))
 
-    def test_existing_padding_token_is_preserved(self):
-        self.tokenizer.pad_token = "<pad>"
-        self.evaluate_with(
-            [
-                {"loss_sum": [1], "token_count": [1], "document_perplexity": [math.e]},
-                {"loss_sum": [1], "token_count": [1], "document_perplexity": [math.e]},
-            ]
-        )
-        self.assertEqual(self.tokenizer.pad_token, "<pad>")
 
-    def test_missing_pad_and_eos_tokens_fail(self):
-        self.tokenizer.eos_token = None
-        with self.assertRaisesRegex(ValueError, "pad token or EOS token"):
-            self.evaluate_with([])
-
-    def test_model_left_on_cpu_is_rejected_before_compilation(self):
-        for member in ("parameters", "buffers"):
-            with self.subTest(member=member):
-                self.setUp()
-                getattr(self.model, member).return_value = [torch.zeros(1)]
-                with self.assertRaisesRegex(RuntimeError, "parameters and buffers"):
-                    self.evaluate_with([])
-
-    def test_compilation_failure_is_not_suppressed(self):
-        with self.assertRaisesRegex(RuntimeError, "compiler failure"):
-            self.evaluate_with([], side_effect=RuntimeError("compiler failure"))
-
-    def test_lazy_compilation_failure_is_not_suppressed(self):
-        with self.assertRaisesRegex(RuntimeError, "lazy compiler failure"):
-            self.evaluate_with(RuntimeError("lazy compiler failure"))
-
-    def test_empty_tokens_fail_cleanly(self):
-        result, *_ = self.evaluate_with(
-            [
-                {
-                    "loss_sum": [0, 0],
-                    "token_count": [0, 0],
-                    "document_perplexity": [None, None],
-                },
-                {"loss_sum": [0], "token_count": [0], "document_perplexity": [None]},
-            ]
-        )
-        self.assertFalse(result.passed)
-        self.assertEqual(result.tests[0].name, "validation_data")
-
-    def test_nonfinite_perplexity_fails(self):
-        result, *_ = self.evaluate_with(
-            [
-                {
-                    "loss_sum": [math.inf, 0],
-                    "token_count": [1, 1],
-                    "document_perplexity": [math.inf, 1],
-                },
-                {"loss_sum": [0], "token_count": [1], "document_perplexity": [1]},
-            ]
-        )
-        self.assertFalse(result.passed)
-        self.assertEqual(result.tests[0].name, "perplexity")
-
-    def test_skips_documents_without_tokens(self):
-        result, *_ = self.evaluate_with(
-            [
-                {
-                    "loss_sum": [1, 0],
-                    "token_count": [1, 0],
-                    "document_perplexity": [math.e, None],
-                },
-                {"loss_sum": [1], "token_count": [1], "document_perplexity": [math.e]},
-            ]
-        )
-        self.assertTrue(result.passed)
-        self.assertEqual(result.metrics["skipped_documents"], 1)
-        self.assertEqual(result.metrics["evaluated_documents"], 2)
-
-    def test_batch_requires_cuda_inputs_and_outputs_and_disables_cache(self):
-        inputs = {key: MagicMock() for key in ("input_ids", "attention_mask")}
-        for tensor in inputs.values():
-            tensor.to.return_value = tensor
-        tokenizer = MagicMock(return_value=inputs)
-        model = MagicMock(return_value=SimpleNamespace(logits=torch.zeros(1)))
-        with self.assertRaisesRegex(RuntimeError, "logits outside cuda:0"):
-            evaluate_perplexity({"text": ["short"]}, model, tokenizer)
-        for tensor in inputs.values():
-            tensor.to.assert_called_once_with(CUDA_DEVICE)
-        model.assert_called_once_with(**inputs, use_cache=False)
-        tokenizer.assert_called_once_with(
-            ["short"],
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            max_length=1024,
-        )
+@pytest.mark.parametrize("lazy", [False, True])
+def test_compilation_failure_propagates(lazy):
+    failure = RuntimeError("compiler failure")
+    compiled = MagicMock(side_effect=failure)
+    with (
+        evaluator_runtime(compiled=compiled, compile_error=None if lazy else failure),
+        patch("judge.evaluators.perplexity.CUDA_DEVICE", torch.device("cpu")),
+        pytest.raises(RuntimeError, match="compiler failure"),
+    ):
+        PerplexityEvaluator().evaluate("model", Dataset.from_dict({"text": ["short"]}))
 
 
 def tiny_model(architecture):
     if architecture == "gpt2":
         return GPT2LMHeadModel(
-            GPT2Config(vocab_size=4, n_positions=1024, n_embd=16, n_layer=1, n_head=2)
+            GPT2Config(vocab_size=4, n_positions=32, n_embd=16, n_layer=1, n_head=2)
         )
     if architecture == "gemma2":
         model = Gemma2ForCausalLM(
             Gemma2Config(
                 vocab_size=4,
-                max_position_embeddings=1024,
+                max_position_embeddings=32,
                 hidden_size=16,
                 intermediate_size=32,
                 head_dim=8,
@@ -336,17 +363,15 @@ def tiny_model(architecture):
                 num_key_value_heads=1,
                 sliding_window=2,
                 final_logit_softcapping=0.1,
-                attn_implementation="eager",
             )
         )
-        with torch.no_grad():
-            model.get_output_embeddings().weight.mul_(20)
+        model.set_attn_implementation("eager")
         return model
     if architecture == "opt":
         return OPTForCausalLM(
             OPTConfig(
                 vocab_size=4,
-                max_position_embeddings=1024,
+                max_position_embeddings=32,
                 hidden_size=16,
                 word_embed_proj_dim=8,
                 ffn_dim=32,
@@ -358,7 +383,7 @@ def tiny_model(architecture):
     return LlamaForCausalLM(
         LlamaConfig(
             vocab_size=4,
-            max_position_embeddings=1024,
+            max_position_embeddings=32,
             hidden_size=16,
             intermediate_size=32,
             num_hidden_layers=1,
@@ -368,36 +393,50 @@ def tiny_model(architecture):
     )
 
 
-@pytest.mark.parametrize("architecture", ["gpt2", "llama"])
-def test_causal_models_trace_as_full_graphs(architecture):
+@pytest.mark.parametrize("architecture", ["gpt2", "llama", "gemma2", "opt"])
+def test_direct_model_fullgraph_scoring_matches_reference_on_cpu(architecture):
+    torch.manual_seed(42)
     model = tiny_model(architecture).eval()
-    compiled = torch.compile(
-        CompilationRequiredModel(model), backend="eager", fullgraph=True, dynamic=True
+    tokenizer = TokenizerStub()
+    inputs = tokenizer(
+        ["short", "long", "tiny"],
+        return_tensors="pt",
+        padding="longest",
+        truncation=True,
     )
     with torch.inference_mode():
-        for batch_size, length in [(2, 4), (1, 1), (2, 8)]:
-            ids = torch.ones(batch_size, length, dtype=torch.long)
-            mask = torch.ones_like(ids)
-            actual = compiled(
-                input_ids=ids, attention_mask=mask, use_cache=False
-            ).logits
-            expected = model(input_ids=ids, attention_mask=mask, use_cache=False).logits
-            torch.testing.assert_close(actual, expected)
+        expected = reference_scores(
+            model(**inputs, return_dict=True, use_cache=False).logits, **inputs
+        )
+        # Exercise Dynamo's fullgraph tracing locally; real Inductor is tested on CUDA below.
+        torch._dynamo.reset()
+        try:
+            compiled = torch.compile(model, backend="eager", fullgraph=True)
+            with patch("judge.evaluators.perplexity.CUDA_DEVICE", torch.device("cpu")):
+                actual = evaluate_perplexity(inputs, compiled, tokenizer)
+            assert_scores(actual, expected)
+        finally:
+            torch._dynamo.reset()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
-@pytest.mark.parametrize("architecture", ["gpt2", "llama"])
-def test_real_cuda_inductor_perplexity(architecture):
+@pytest.mark.parametrize("architecture", ["gpt2", "llama", "gemma2", "opt"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_real_cuda_inductor_evaluator_matches_reference(architecture, dtype):
     torch.manual_seed(42)
-    model = tiny_model(architecture)
-    torch.nn.Module.to(model, device=CUDA_DEVICE)
-    model.eval()
-    tokenizer = TokenizerStub()
-    tokenizer.padding_side = "right"
-    dataset = Dataset.from_dict({"text": ["short", "long", "tiny"]})
+    model = tiny_model(architecture).to(device=CUDA_DEVICE, dtype=dtype).eval()
+    tokenizer = TokenizerStub(pad_token_id=2)
+    texts = ["short", "long", "tiny"]
+    inputs = {
+        k: v.to(CUDA_DEVICE)
+        for k, v in tokenizer(
+            texts, return_tensors="pt", padding="longest", truncation=True
+        ).items()
+    }
     with torch.inference_mode():
-        baseline = evaluate_perplexity({"text": ["short", "long"]}, model, tokenizer)
-    expected = math.exp(sum(baseline["loss_sum"]) / sum(baseline["token_count"]))
+        expected = reference_scores(
+            model(**inputs, return_dict=True, use_cache=False).logits, **inputs
+        )
     with (
         patch(
             "judge.evaluators.perplexity.AutoModelForCausalLM.from_pretrained",
@@ -408,139 +447,260 @@ def test_real_cuda_inductor_perplexity(architecture):
             return_value=tokenizer,
         ),
     ):
-        result = PerplexityEvaluator(batch_size=2).evaluate(
-            f"test/tiny-{architecture}", dataset
-        )
+        torch._dynamo.reset()
+        try:
+            result = PerplexityEvaluator(batch_size=2).evaluate(
+                f"test/tiny-{architecture}", Dataset.from_dict({"text": texts})
+            )
+        finally:
+            torch._dynamo.reset()
     assert result.passed
-    assert result.score == pytest.approx(expected, rel=1e-4)
+    assert result.score == pytest.approx(
+        math.exp(sum(expected["loss_sum"]) / 4), rel=2e-3
+    )
+    assert result.metrics["evaluated_tokens"] == 4
     assert result.metrics["skipped_documents"] == 1
 
 
-def test_eager_model_forward_is_rejected():
-    model = MagicMock()
-    with pytest.raises(RuntimeError, match="forward requires torch.compile"):
-        CompilationRequiredModel(model)(input_ids=torch.ones(1, 2, dtype=torch.long))
-    model.assert_not_called()
+class PackedTokenizerStub(TokenizerStub):
+    def __call__(self, texts, **kwargs):
+        assert kwargs["padding"] is False
+        assert kwargs["truncation"] is True
+        sequences = {"short": [1, 2], "long": [1, 3, 2, 3], "tiny": [1], "empty": []}
+        return {
+            "input_ids": [sequences[text][: kwargs["max_length"]] for text in texts]
+        }
 
 
-def test_disabled_compile_cannot_silently_run_eager():
-    model = MagicMock()
-    compiled = torch.compile(CompilationRequiredModel(model), disable=True)
-    with pytest.raises(RuntimeError, match="forward requires torch.compile"):
-        compiled(input_ids=torch.ones(1, 2, dtype=torch.long))
-    model.assert_not_called()
-
-
-@pytest.mark.parametrize("chunk_size", [1, 3, 8, 100])
-def test_chunked_loss_matches_full_logits_with_padding_and_document_boundaries(
-    chunk_size,
-):
-    torch.manual_seed(42)
-    inputs = TokenizerStub()(["short", "long", "tiny"], padding="longest")
-    hidden = torch.randn(3, 4, 8)
-    head = torch.nn.Linear(8, 4)
-    expected = score_logits(head(hidden), **inputs)
-
-    def loss_fn(h, y):
-        return F.cross_entropy(head(h).float(), y, reduction="none")
-
-    actual = score_hidden_states(
-        hidden, **inputs, loss_fn=loss_fn, chunk_size=chunk_size
-    )
-    assert actual["token_count"] == expected["token_count"]
-    assert actual["loss_sum"] == pytest.approx(expected["loss_sum"], abs=1e-6)
-    assert actual["document_perplexity"][-1] is None
-    assert actual["document_perplexity"][:2] == pytest.approx(
-        expected["document_perplexity"][:2], rel=1e-6
-    )
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"logits_chunk_size": 0},
-        {"dtype": "int8"},
-    ],
-)
-def test_invalid_optimized_evaluator_settings(kwargs):
+@pytest.mark.parametrize("lengths", [[2, 3, 5], [2049, 2, 9]])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_packed_scores_match_independent_documents_across_ce_chunks(lengths, dtype):
+    torch.manual_seed(123)
+    documents = [torch.randint(0, 4, (length,)).tolist() for length in lengths]
+    # EOS is a real target, including directly before a boundary.
+    for ids in documents:
+        ids[-1] = 2
+    logits = torch.randn(1, sum(lengths), 4).to(dtype)
+    model = MagicMock(return_value=SimpleNamespace(logits=logits))
+    expected = {"loss_sum": [], "token_count": [], "document_perplexity": []}
+    start = 0
+    for ids in documents:
+        document = torch.tensor([ids])
+        scores = reference_scores(
+            logits[:, start : start + len(ids)], document, torch.ones_like(document)
+        )
+        for key, values in expected.items():
+            values.extend(scores[key])
+        start += len(ids)
     with (
-        patch("judge.evaluators.perplexity.torch.cuda.is_available", return_value=True),
-        pytest.raises(ValueError),
+        patch("judge.evaluators.perplexity.CUDA_DEVICE", torch.device("cpu")),
+        patch(
+            "judge.evaluators.perplexity.F.cross_entropy", wraps=F.cross_entropy
+        ) as ce,
     ):
-        PerplexityEvaluator(**kwargs).validate_runtime()
+        actual = eval_batch_ppl(model, documents)
+    assert_scores(actual, expected)
+    assert max(call.args[0].shape[0] for call in ce.call_args_list) <= CE_CHUNK_SIZE
+    assert len(ce.call_args_list) == math.ceil((sum(lengths) - 1) / CE_CHUNK_SIZE)
+    inputs = model.call_args.kwargs
+    assert inputs["input_ids"].tolist() == [
+        [token for ids in documents for token in ids]
+    ]
+    assert inputs["position_ids"].tolist() == [
+        [position for length in lengths for position in range(length)]
+    ]
+    boundaries = [0, *np.cumsum(lengths).tolist()]
+    assert inputs["cu_seq_lens_q"].tolist() == boundaries
+    assert inputs["cu_seq_lens_k"].tolist() == boundaries
+    assert inputs["cu_seq_lens_q"].dtype == torch.int32
+    assert inputs["max_length_q"] == inputs["max_length_k"] == max(lengths)
+    assert not inputs["use_cache"]
+
+
+@pytest.mark.parametrize("documents", [[], [[]], [[1]], [[1, 2], [3]]])
+def test_packed_scorer_rejects_empty_or_short_documents(documents):
+    model = MagicMock()
+    with pytest.raises(ValueError, match="at least two tokens"):
+        eval_batch_ppl(model, documents)
+    model.assert_not_called()
+
+
+@pytest.mark.parametrize("budget", [2, 4, 6, 8])
+def test_packed_evaluator_tokenizes_truncates_flushes_and_preserves_corpus_score(
+    budget, capsys
+):
+    model = MagicMock(
+        side_effect=lambda **inputs: SimpleNamespace(
+            logits=torch.zeros(*inputs["input_ids"].shape, 4)
+        )
+    )
+    tokenizer = PackedTokenizerStub(pad_token_id=None, eos_token_id=None)
+    dataset = Dataset.from_dict(
+        {"text": ["short", "long", "tiny", "empty", "short"], "metadata": [0] * 5}
+    )
+    with (
+        evaluator_runtime(tokenizer, compiled=model) as runtime,
+        patch("judge.evaluators.perplexity.CUDA_DEVICE", torch.device("cpu")),
+    ):
+        result = PerplexityEvaluator(max_seq_length=budget, dtype="bfloat16").evaluate(
+            "student/model", dataset
+        )
+    assert result.passed
+    assert result.score == pytest.approx(4)
+    assert result.metrics["evaluated_tokens"] == 2 + min(budget, 4) - 1
+    assert result.metrics["evaluated_documents"] == 3
+    assert result.metrics["skipped_documents"] == 2
+    runtime.load_model.assert_called_once_with(
+        "student/model",
+        dtype="bfloat16",
+        attn_implementation="kernels-community/flash-attn2",
+    )
+    runtime.compile.assert_called_once_with(runtime.model, dynamic=True, fullgraph=True)
+    for call in model.call_args_list:
+        assert call.kwargs["input_ids"].numel() <= budget
+    output = capsys.readouterr().out
+    assert "running_corpus_perplexity=4.0000" in output
+    assert "rolling_corpus_perplexity=4.0000" in output
+    assert "last 3 scored documents" in output
+
+
+@pytest.mark.parametrize("texts", [[], ["empty", "tiny"]])
+def test_packed_evaluator_without_scorable_documents_fails_cleanly(texts):
+    with evaluator_runtime(PackedTokenizerStub()) as runtime:
+        result = PerplexityEvaluator(max_seq_length=8).evaluate(
+            "model", Dataset.from_dict({"text": texts})
+        )
+    assert not result.passed
+    assert result.tests[0].name == "validation_data"
+    runtime.compiled.assert_not_called()
+
+
+def test_rolling_logging_uses_last_1000_documents_and_cumulative_token_weights(capsys):
+    # First document falls out of the rolling window. Unequal lengths ensure
+    # averaging document PPLs or document losses would give the wrong value.
+    batches = [
+        {"loss_sum": [10], "token_count": [1], "document_perplexity": [math.exp(10)]},
+        {
+            "loss_sum": [0, 6] * 500,
+            "token_count": [1, 3] * 500,
+            "document_perplexity": [1, math.exp(2)] * 500,
+        },
+    ]
+    with (
+        evaluator_runtime(),
+        patch("judge.evaluators.perplexity.evaluate_perplexity", side_effect=batches),
+        patch("judge.evaluators.perplexity.time.monotonic", side_effect=[0, 31, 62]),
+    ):
+        result = PerplexityEvaluator(batch_size=1000).evaluate(
+            "model", Dataset.from_dict({"text": ["short"] * 1001})
+        )
+    assert result.score == pytest.approx(math.exp(3010 / 2001))
+    output = capsys.readouterr().out
+    assert (
+        f"rolling_corpus_perplexity={math.exp(1.5):.4f} (last 1000 scored documents)"
+        in output
+    )
+    assert f"running_corpus_perplexity={math.exp(3010 / 2001):.4f}" in output
+    assert "scored 1/1001 documents" in output
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_llama_packed_flashattention_dispatch_matches_independent_documents_on_cpu(
+    compiled, monkeypatch
+):
+    # Use Transformers' actual FA2/varlen dispatch, replacing only the CUDA
+    # kernel with dense CPU attention. This checks kwargs forwarding, RoPE
+    # resets, causal masking, and document isolation with real model weights.
+    import transformers.modeling_flash_attention_utils as flash_utils
+
+    def reference_varlen(query, key, value, cu_seqlens_q, cu_seqlens_k, **kwargs):
+        positions = torch.arange(query.shape[0], device=query.device)
+        q_documents = torch.bucketize(positions, cu_seqlens_q[1:-1], right=True)
+        k_documents = torch.bucketize(positions, cu_seqlens_k[1:-1], right=True)
+        mask = (q_documents[:, None] == k_documents[None, :]) & (
+            positions[:, None] >= positions[None, :]
+        )
+        result = F.scaled_dot_product_attention(
+            query.transpose(0, 1),
+            key.transpose(0, 1),
+            value.transpose(0, 1),
+            attn_mask=mask,
+            scale=kwargs["softmax_scale"],
+        )
+        return result.transpose(0, 1)
+
+    monkeypatch.setattr(
+        flash_utils,
+        "lazy_import_flash_attention",
+        lambda *args: ((None, reference_varlen, None, None, None), (dict, dict)),
+    )
+    torch.manual_seed(42)
+    model = tiny_model("llama").to(dtype=torch.bfloat16).eval()
+    documents = [[1, 2], [3, 1, 2, 3], [2, 1, 2]]
+    expected = {"loss_sum": [], "token_count": [], "document_perplexity": []}
+    with torch.inference_mode():
+        for ids in documents:
+            inputs = torch.tensor([ids])
+            logits = model(input_ids=inputs, use_cache=False).logits
+            scores = reference_scores(logits, inputs, torch.ones_like(inputs))
+            for key, values in expected.items():
+                values.extend(scores[key])
+    model.config._attn_implementation = "flash_attention_2"
+    torch._dynamo.reset()
+    try:
+        if compiled:
+            model = torch.compile(model, backend="eager", dynamic=True, fullgraph=True)
+        with patch("judge.evaluators.perplexity.CUDA_DEVICE", torch.device("cpu")):
+            actual = eval_batch_ppl(model, documents)
+        assert_scores(actual, expected, rel=2e-3)
+    finally:
+        torch._dynamo.reset()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("architecture", ["gpt2", "llama", "gemma2", "opt"])
-def test_cuda_chunked_scoring_matches_masked_full_logits(dtype, architecture):
+def test_real_cuda_packed_flashattention_and_inductor_match_independent_documents():
     torch.manual_seed(42)
-    model = tiny_model(architecture).to(device=CUDA_DEVICE, dtype=dtype).eval()
-    inputs = {
-        k: v.to(CUDA_DEVICE)
-        for k, v in TokenizerStub()(
-            ["short", "long", "tiny"], padding="longest"
-        ).items()
-    }
+    model = tiny_model("llama").to(device=CUDA_DEVICE, dtype=torch.bfloat16).eval()
+    documents = [[1, 2], [3, 1, 2, 3], [2, 1, 2]]
+    expected = {"loss_sum": [], "token_count": [], "document_perplexity": []}
     with torch.inference_mode():
-        reference = torch.compile(
-            CompilationRequiredModel(model),
-            backend="inductor",
-            fullgraph=True,
-            dynamic=True,
-        )
-        expected = score_logits(reference(**inputs, use_cache=False).logits, **inputs)
-        original_base = model.base_model
-        original_attention = model.config._attn_implementation
-        actual = ChunkedPerplexityModel(model, chunk_size=3).score(inputs)
-        assert model.base_model is original_base
-        assert model.config._attn_implementation == original_attention
-    assert actual["token_count"] == expected["token_count"]
-    assert actual["loss_sum"] == pytest.approx(expected["loss_sum"], rel=1e-4, abs=1e-6)
+        for ids in documents:
+            inputs = torch.tensor([ids], device=CUDA_DEVICE)
+            logits = model(input_ids=inputs, use_cache=False).logits
+            scores = reference_scores(logits, inputs, torch.ones_like(inputs))
+            for key, values in expected.items():
+                values.extend(scores[key])
+    model.set_attn_implementation("kernels-community/flash-attn2")
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(model, dynamic=True, fullgraph=True)
+        actual = eval_batch_ppl(compiled, documents)
+        assert_scores(actual, expected, rel=2e-3)
+    finally:
+        torch._dynamo.reset()
 
 
-def test_output_head_rejects_disabled_compilation():
-    compiled = torch.compile(OutputHeadLoss(tiny_model("llama").eval()), disable=True)
-    with pytest.raises(RuntimeError, match="loss requires torch.compile"):
-        compiled(torch.randn(2, 16), torch.ones(2, dtype=torch.long))
+def test_explicit_hub_kernel_preserves_real_loading_error(tmp_path, monkeypatch):
+    from transformers import modeling_utils
 
+    # Exercise real from_pretrained dispatch: implicit FA2 fallback would replace
+    # this error with "flash_attn not installed", hiding the actionable cause.
+    tiny_model("llama").save_pretrained(tmp_path)
+    requested = []
 
-@pytest.mark.parametrize("architecture", ["gpt2", "llama", "gemma2", "opt"])
-def test_standard_decoder_head_interfaces_enable_chunking(architecture):
-    assert supports_chunked_scoring(tiny_model(architecture))
-    assert not supports_chunked_scoring(tiny_model(architecture).base_model)
+    def unavailable_binary(implementation, **kwargs):
+        requested.append(implementation)
+        raise ValueError("No compatible prebuilt kernel for this CUDA runtime")
 
-
-def test_decoder_replay_requires_hidden_states():
-    from transformers.modeling_outputs import BaseModelOutputWithPast
-
-    with pytest.raises(RuntimeError, match="requires decoder states"):
-        DecoderReplay(BaseModelOutputWithPast, "last_hidden_state")()
-
-
-@pytest.mark.parametrize("architecture", ["gpt2", "llama", "gemma2", "opt"])
-def test_generic_chunked_scoring_traces_on_cpu_with_native_model_heads(architecture):
-    torch.manual_seed(42)
-    model = tiny_model(architecture).eval()
-    inputs = TokenizerStub()(["short", "long", "tiny"], padding="longest")
-    original_compile = torch.compile
-
-    def compile_for_tracing(
-        module: torch.nn.Module, *, backend: str, fullgraph: bool, dynamic: bool
+    monkeypatch.setattr(modeling_utils, "is_kernels_available", lambda: True)
+    monkeypatch.setattr(
+        modeling_utils, "lazy_import_flash_attention", unavailable_binary
+    )
+    with (
+        patch("judge.evaluators.perplexity.torch.cuda.is_available", return_value=True),
+        pytest.raises(ValueError, match="No compatible prebuilt kernel"),
     ):
-        return original_compile(
-            module, backend="eager", fullgraph=fullgraph, dynamic=dynamic
+        PerplexityEvaluator(max_seq_length=8192, dtype="bfloat16").evaluate(
+            str(tmp_path), Dataset.from_dict({"text": ["short"]})
         )
-
-    with torch.inference_mode():
-        expected = score_logits(model(**inputs, use_cache=False).logits, **inputs)
-        with (
-            patch("judge.evaluators.perplexity.CUDA_DEVICE", torch.device("cpu")),
-            patch(
-                "judge.evaluators.perplexity.torch.compile",
-                side_effect=compile_for_tracing,
-            ),
-        ):
-            actual = ChunkedPerplexityModel(model, chunk_size=3).score(inputs)
-    assert actual["token_count"] == expected["token_count"]
-    assert actual["loss_sum"] == pytest.approx(expected["loss_sum"], rel=1e-4, abs=1e-6)
+    assert requested == ["kernels-community/flash-attn2"]

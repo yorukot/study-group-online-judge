@@ -27,7 +27,15 @@ TERMINAL_STATES = {
     "PREEMPTED",
     "TIMEOUT",
 }
-EXCLUDE_NODES = ["25a-hgpn003", "25a-hgpn062", "25a-hgpn145"]
+# Exclude entire nodes: Slurm cannot safely select around the faulty physical
+# GPUs (001: GPU 7, 003: GPU 6, 027: GPU 0, all requiring a reset).
+EXCLUDE_NODES = [
+    "25a-hgpn001",
+    "25a-hgpn003",
+    "25a-hgpn027",
+    "25a-hgpn062",
+    "25a-hgpn145",
+]
 
 
 class _SlurmLogContext(TypedDict):
@@ -84,7 +92,7 @@ class SlurmExecutor:
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=120,
                 **kwargs,
             )
         except (subprocess.SubprocessError, OSError) as error:
